@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Weather App Demo</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', sans-serif;
+            background: linear-gradient(to bottom right, #60a5fa, #3b82f6);
+            color: white;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+
+        .weather-card {
+            background: rgba(255, 255, 255, 0.2);
+            padding: 2rem;
+            border-radius: 1rem;
+            backdrop-filter: blur(10px);
+            text-align: center;
+            width: 300px;
+            box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 3rem;
+        }
+
+        h2 {
+            margin: 0.5rem 0;
+            font-weight: 400;
+        }
+
+        .details {
+            margin-top: 1rem;
+            font-size: 0.9rem;
+            opacity: 0.9;
+        }
+
+        .search {
+            margin-bottom: 1.5rem;
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        input {
+            flex: 1;
+            padding: 0.5rem;
+            border: none;
+            border-radius: 20px;
+            outline: none;
+            padding-left: 1rem;
+        }
+
+        button {
+            background: #2563eb;
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            cursor: pointer;
+        }
+
+        .back-link {
+            display: block;
+            margin-top: 1.5rem;
+            color: rgba(255, 255, 255, 0.7);
+            text-decoration: none;
+            font-size: 0.8rem;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="weather-card">
+        <div class="search">
+            <input type="text" id="cityInput" value="Bangalore">
+            <button onclick="updateWeather()">Search</button>
+        </div>
+        <h2 id="city">Bangalore, IN</h2>
+        <h1 id="temp">28°C</h1>
+        <p id="condition">Partly Cloudy</p>
+        <div class="details">
+            <p>Humidity: 65% • Wind: 12 km/h</p>
+        </div>
+        <a href="../../index.html" class="back-link">← Back to Portfolio</a>
+    </div>
+
+    <script>
+        function updateWeather() {
+            const city = document.getElementById('cityInput').value;
+            // Mock data for demo purposes since we don't have a backend/API key
+            const temps = [24, 28, 32, 19, 22];
+            const conditions = ['Sunny', 'Cloudy', 'Rainy', 'Clear', 'Stormy'];
+
+            document.getElementById('city').innerText = city + ", IN";
+            document.getElementById('temp').innerText = temps[Math.floor(Math.random() * temps.length)] + "°C";
+            document.getElementById('condition').innerText = conditions[Math.floor(Math.random() * conditions.length)];
+        }
+    </script>
+</body>
+
+</html>

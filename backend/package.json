@@ -1,0 +1,30 @@
+{
+  "name": "cloudcostguard-backend",
+  "version": "1.0.0",
+  "description": "CloudCostGuard Backend - Node.js Express API",
+  "main": "server.js",
+  "scripts": {
+    "dev": "node --watch server.js",
+    "start": "node server.js",
+    "db:setup": "node scripts/setup-database.js",
+    "ml:train": "node scripts/train-model.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudwatch": "^3.400.0",
+    "@aws-sdk/client-cost-explorer": "^3.1019.0",
+    "@aws-sdk/client-ec2": "^3.400.0",
+    "@aws-sdk/client-lambda": "^3.400.0",
+    "@aws-sdk/client-rds": "^3.400.0",
+    "@aws-sdk/client-s3": "^3.400.0",
+    "@aws-sdk/credential-providers": "^3.400.0",
+    "bcryptjs": "^3.0.3",
+    "connect-sqlite3": "^0.9.16",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "express-rate-limit": "^8.3.1",
+    "express-session": "^1.19.0",
+    "sql.js": "^1.8.0",
+    "uuid": "^9.0.0"
+  }
+}

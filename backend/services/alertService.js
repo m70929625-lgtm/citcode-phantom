@@ -18,6 +18,7 @@ const SEVERITY = {
 };
 
 function createAlert({
+    userId,
     type,
     severity = SEVERITY.INFO,
     title,
@@ -30,19 +31,18 @@ function createAlert({
     const alertId = `alert_${uuidv4().slice(0, 8)}`;
 
     runSql(`
-        INSERT INTO alerts (id, type, severity, title, message, resource_id, resource_name, action_id, anomaly_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [alertId, type, severity, title, message, resourceId, resourceName, actionId, anomalyId]);
+        INSERT INTO alerts (id, user_id, type, severity, title, message, resource_id, resource_name, action_id, anomaly_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [alertId, userId, type, severity, title, message, resourceId, resourceName, actionId, anomalyId]);
 
-    loggerService.info('alerts', `Alert created: ${title}`, { id: alertId, type, severity, resourceId });
-
+    loggerService.info('alerts', `Alert created: ${title}`, { id: alertId, userId, type, severity, resourceId });
     return alertId;
 }
 
-function getActiveAlerts(limit = 20) {
+function getActiveAlerts(userId, limit = 20) {
     return queryAll(`
         SELECT * FROM alerts
-        WHERE acknowledged = 0
+        WHERE user_id = ? AND acknowledged = 0
         ORDER BY
             CASE severity
                 WHEN 'critical' THEN 1
@@ -51,12 +51,12 @@ function getActiveAlerts(limit = 20) {
             END,
             created_at DESC
         LIMIT ?
-    `, [limit]);
+    `, [userId, limit]);
 }
 
-function getAllAlerts({ acknowledged = null, limit = 50, severity = null } = {}) {
-    let query = 'SELECT * FROM alerts WHERE 1=1';
-    const params = [];
+function getAllAlerts(userId, { acknowledged = null, limit = 50, severity = null } = {}) {
+    let query = 'SELECT * FROM alerts WHERE user_id = ?';
+    const params = [userId];
 
     if (acknowledged !== null) {
         query += ' AND acknowledged = ?';
@@ -70,30 +70,29 @@ function getAllAlerts({ acknowledged = null, limit = 50, severity = null } = {})
 
     query += ' ORDER BY created_at DESC LIMIT ?';
     params.push(limit);
-
     return queryAll(query, params);
 }
 
-function acknowledgeAlert(alertId) {
-    const alert = queryOne('SELECT * FROM alerts WHERE id = ?', [alertId]);
+function acknowledgeAlert(userId, alertId) {
+    const alert = queryOne('SELECT * FROM alerts WHERE user_id = ? AND id = ?', [userId, alertId]);
     if (!alert) return null;
 
-    runSql('UPDATE alerts SET acknowledged = 1 WHERE id = ?', [alertId]);
-    loggerService.info('alerts', `Alert acknowledged: ${alertId}`);
-    return queryOne('SELECT * FROM alerts WHERE id = ?', [alertId]);
+    runSql('UPDATE alerts SET acknowledged = 1 WHERE user_id = ? AND id = ?', [userId, alertId]);
+    loggerService.info('alerts', `Alert acknowledged: ${alertId}`, { userId });
+    return queryOne('SELECT * FROM alerts WHERE user_id = ? AND id = ?', [userId, alertId]);
 }
 
-function acknowledgeAllAlerts() {
-    runSql('UPDATE alerts SET acknowledged = 1 WHERE acknowledged = 0');
-    loggerService.info('alerts', 'All alerts acknowledged');
+function acknowledgeAllAlerts(userId) {
+    runSql('UPDATE alerts SET acknowledged = 1 WHERE user_id = ? AND acknowledged = 0', [userId]);
+    loggerService.info('alerts', 'All alerts acknowledged', { userId });
 }
 
-function deleteAlert(alertId) {
-    runSql('DELETE FROM alerts WHERE id = ?', [alertId]);
-    loggerService.info('alerts', `Alert deleted: ${alertId}`);
+function deleteAlert(userId, alertId) {
+    runSql('DELETE FROM alerts WHERE user_id = ? AND id = ?', [userId, alertId]);
+    loggerService.info('alerts', `Alert deleted: ${alertId}`, { userId });
 }
 
-function getAlertCounts() {
+function getAlertCounts(userId) {
     return queryOne(`
         SELECT
             COUNT(*) as total,
@@ -102,11 +101,11 @@ function getAlertCounts() {
             SUM(CASE WHEN severity = 'warning' AND acknowledged = 0 THEN 1 ELSE 0 END) as warning,
             SUM(CASE WHEN severity = 'info' AND acknowledged = 0 THEN 1 ELSE 0 END) as info
         FROM alerts
-    `);
+        WHERE user_id = ?
+    `, [userId]);
 }
 
-// Create standard alert templates
-function alertAnomalyDetected(anomaly, confidence, action) {
+function alertAnomalyDetected(userId, anomaly, confidence, action) {
     const severity = confidence >= 0.7 ? SEVERITY.CRITICAL : confidence >= 0.5 ? SEVERITY.WARNING : SEVERITY.INFO;
 
     let actionText = '';
@@ -121,6 +120,7 @@ function alertAnomalyDetected(anomaly, confidence, action) {
     }
 
     return createAlert({
+        userId,
         type: ALERT_TYPES.ANOMALY,
         severity,
         title: `Cost Anomaly: ${anomaly.type}`,
@@ -131,8 +131,9 @@ function alertAnomalyDetected(anomaly, confidence, action) {
     });
 }
 
-function alertAutoApproved(action, anomaly, confidence) {
+function alertAutoApproved(userId, action, anomaly, confidence) {
     return createAlert({
+        userId,
         type: ALERT_TYPES.ACTION_AUTO_APPROVED,
         severity: SEVERITY.INFO,
         title: `Action Auto-Approved (${Math.round(confidence * 100)}% confidence)`,
@@ -144,8 +145,9 @@ function alertAutoApproved(action, anomaly, confidence) {
     });
 }
 
-function alertActionExecuted(action) {
+function alertActionExecuted(userId, action) {
     return createAlert({
+        userId,
         type: ALERT_TYPES.ACTION_EXECUTED,
         severity: SEVERITY.INFO,
         title: `Action Executed: ${action.actionType.replace('_', ' ')}`,
@@ -156,10 +158,11 @@ function alertActionExecuted(action) {
     });
 }
 
-function alertCostSpike(resourceName, currentCost, expectedCost, resourceId) {
+function alertCostSpike(userId, resourceName, currentCost, expectedCost, resourceId) {
     const spikePercent = expectedCost > 0 ? Math.round(((currentCost - expectedCost) / expectedCost) * 100) : 0;
 
     return createAlert({
+        userId,
         type: ALERT_TYPES.COST_SPIKE,
         severity: spikePercent >= 100 ? SEVERITY.CRITICAL : SEVERITY.WARNING,
         title: `Cost Spike Detected: ${resourceName}`,

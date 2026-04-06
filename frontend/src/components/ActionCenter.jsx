@@ -1,20 +1,34 @@
 import { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import { RefreshCw, Zap, CheckCircle, XCircle, Clock, Play, Shield, Bell, AlertTriangle } from 'lucide-react';
 import GlassCard from './GlassCard';
 import { getActions, getActionStats, approveAction, executeAction, dismissAction, getStatus } from '../hooks/useApi';
 import { formatRelativeTime, formatCurrency } from '../utils/formatters';
 
-export default function ActionCenter() {
+function normalizeActionStatus(status) {
+  if (status === 'all') return 'all';
+  if (['pending', 'approved', 'executed', 'dismissed', 'failed'].includes(status)) return status;
+  return null;
+}
+
+export default function ActionCenter({ filters = {} }) {
   const [actions, setActions] = useState([]);
   const [stats, setStats] = useState(null);
   const [status, setStatus] = useState(null);
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState(null);
-  const [filter, setFilter] = useState('pending');
+  const [filter, setFilter] = useState(normalizeActionStatus(filters.status) || 'pending');
+
+  useEffect(() => {
+    const nextGlobalStatus = normalizeActionStatus(filters.status);
+    if (nextGlobalStatus && nextGlobalStatus !== filter) {
+      setFilter(nextGlobalStatus);
+    }
+  }, [filters.status]);
 
   useEffect(() => {
     loadData();
-  }, [filter]);
+  }, [filter, filters.service]);
 
   const loadData = async () => {
     setLoading(true);
@@ -25,7 +39,16 @@ export default function ActionCenter() {
         getStatus()
       ]);
 
-      setActions(actionsData.data || []);
+      const filteredActions = (actionsData.data || []).filter((action) => {
+        if (!filters.service || filters.service === 'all') {
+          return true;
+        }
+        return action.resourceId?.toLowerCase().includes(filters.service.toLowerCase())
+          || action.resourceName?.toLowerCase().includes(filters.service.toLowerCase())
+          || action.actionType?.toLowerCase().includes(filters.service.toLowerCase());
+      });
+
+      setActions(filteredActions);
       setStats(statsData);
       setStatus(statusData);
     } catch (error) {
@@ -201,7 +224,9 @@ export default function ActionCenter() {
                   <div className="flex items-start justify-between gap-4">
                     <div>
                       <div className="flex items-center gap-2 mb-1">
-                        <span className="font-semibold text-apple-gray-800">{action.resourceName}</span>
+                        <Link to={`/actions/${encodeURIComponent(action.id)}`} className="font-semibold text-apple-gray-800 hover:text-apple-blue">
+                          {action.resourceName}
+                        </Link>
                         <span className="text-xs px-2 py-0.5 rounded-full bg-apple-gray-100 text-apple-gray-600">
                           {action.actionType.replace('_', ' ')}
                         </span>

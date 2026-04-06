@@ -19,6 +19,8 @@ const statusRoutes = require('./routes/status');
 const recommendationsRoutes = require('./routes/recommendations');
 const costsRoutes = require('./routes/costs');
 const settingsRoutes = require('./routes/settings');
+const viewsRoutes = require('./routes/views');
+const reportsRoutes = require('./routes/reports');
 const authRoutes = require('./routes/auth');
 const alertsRoutes = require('./routes/alerts');
 
@@ -104,6 +106,8 @@ app.use('/api/recommendations', requireAuth, recommendationsRoutes);
 app.use('/api/alerts', requireAuth, alertsRoutes);
 app.use('/api/costs', requireAuth, costsRoutes);
 app.use('/api/settings', requireAuth, settingsRoutes);
+app.use('/api/views', requireAuth, viewsRoutes);
+app.use('/api/reports', requireAuth, reportsRoutes);
 
 // Health check
 app.get('/health', (req, res) => {

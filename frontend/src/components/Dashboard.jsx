@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { RefreshCw, Monitor, AlertTriangle, IndianRupee, Zap, CheckCircle, XCircle, Clock, TrendingUp, Download } from 'lucide-react';
 import GlassCard from './GlassCard';
 import MetricCard from './MetricCard';
@@ -18,6 +18,21 @@ import {
 import { getAnomalies, getRecommendations, getActionStats, fetchMetrics, getMetrics, getMetricsSummary } from '../hooks/useApi';
 import { formatCurrency, formatRelativeTime, formatPercent, formatNumber } from '../utils/formatters';
 
+const LIVE_FETCH_INTERVAL_MS = 60000;
+const UI_REFRESH_INTERVAL_MS = 10000;
+const USAGE_TREND_WINDOW_MINUTES = 90;
+const USAGE_TREND_MAX_POINTS = 90;
+
+function mapWindowToSummaryPeriod(windowValue) {
+  if (windowValue === '7d') return '7d';
+  if (windowValue === '30d' || windowValue === '90d') return '30d';
+  return '24h';
+}
+
+function normalizeAnomalyStatus(status) {
+  return ['new', 'acknowledged', 'resolved'].includes(status) ? status : 'new';
+}
+
 function buildUsageTrend(metrics) {
   const buckets = {};
 
@@ -27,7 +42,7 @@ function buildUsageTrend(metrics) {
       continue;
     }
 
-    date.setMinutes(0, 0, 0);
+    date.setSeconds(0, 0);
     const key = date.toISOString();
 
     if (!buckets[key]) {
@@ -51,10 +66,12 @@ function buildUsageTrend(metrics) {
 
   return Object.values(buckets)
     .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-    .slice(-24)
+    .slice(-USAGE_TREND_MAX_POINTS)
     .map((bucket) => ({
       time: new Intl.DateTimeFormat('en-IN', {
-        hour: 'numeric'
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false
       }).format(new Date(bucket.timestamp)),
       cpu: bucket.cpuCount ? bucket.cpuTotal / bucket.cpuCount : 0,
       networkMb: bucket.networkBytes / (1024 * 1024)
@@ -91,7 +108,7 @@ function buildServiceUsage(summaryRows) {
     .sort((a, b) => b.resources - a.resources);
 }
 
-export default function Dashboard({ status, onRefresh }) {
+export default function Dashboard({ status, onRefresh, filters = {} }) {
   const [loading, setLoading] = useState(false);
   const [anomalies, setAnomalies] = useState([]);
   const [recommendations, setRecommendations] = useState([]);
@@ -99,45 +116,123 @@ export default function Dashboard({ status, onRefresh }) {
   const [recentActivity, setRecentActivity] = useState([]);
   const [usageTrend, setUsageTrend] = useState([]);
   const [serviceUsage, setServiceUsage] = useState([]);
+  const refreshInProgressRef = useRef(false);
 
-  useEffect(() => {
-    loadDashboardData();
-  }, []);
-
-  const loadDashboardData = async () => {
+  const loadDashboardData = useCallback(async () => {
     try {
-      const startDate = new Date(Date.now() - (24 * 60 * 60 * 1000)).toISOString();
+      const startDate = new Date(Date.now() - (USAGE_TREND_WINDOW_MINUTES * 60 * 1000)).toISOString();
+      const anomalyStatus = normalizeAnomalyStatus(filters.status);
+      const summaryPeriod = mapWindowToSummaryPeriod(filters.window);
 
       const [anomaliesData, recsData, actionsData, metricsData, summaryData] = await Promise.all([
-        getAnomalies({ status: 'new', limit: 5 }),
+        getAnomalies({ status: anomalyStatus, limit: 5 }),
         getRecommendations(),
         getActionStats(),
-        getMetrics({ startDate, limit: 500 }),
-        getMetricsSummary('24h')
+        getMetrics({ startDate, limit: 5000 }),
+        getMetricsSummary(summaryPeriod)
       ]);
 
-      setAnomalies(anomaliesData.data || []);
+      const serviceFilteredAnomalies = (anomaliesData.data || []).filter((anomaly) => {
+        if (!filters.service || filters.service === 'all') {
+          return true;
+        }
+        return anomaly.resourceType === filters.service;
+      });
+
+      setAnomalies(serviceFilteredAnomalies);
       setRecommendations(recsData.data || []);
       setActionStats(actionsData);
       setRecentActivity(actionsData.recentActivity || []);
       setUsageTrend(buildUsageTrend(metricsData.data || []));
-      setServiceUsage(buildServiceUsage(summaryData.data || []));
+      const usageRows = buildServiceUsage(summaryData.data || []);
+      const filteredUsageRows = usageRows.filter((row) => {
+        if (!filters.service || filters.service === 'all') {
+          return true;
+        }
+        return row.name === filters.service;
+      });
+      setServiceUsage(filteredUsageRows);
     } catch (error) {
       console.error('Failed to load dashboard data:', error);
     }
-  };
+  }, [filters.service, filters.status, filters.window]);
+
+  const refreshView = useCallback(async (showLoader = false) => {
+    if (refreshInProgressRef.current) {
+      return;
+    }
+
+    refreshInProgressRef.current = true;
+
+    if (showLoader) {
+      setLoading(true);
+    }
+
+    try {
+      await loadDashboardData();
+      await onRefresh?.();
+    } catch (error) {
+      console.error('Failed to refresh dashboard view:', error);
+    } finally {
+      if (showLoader) {
+        setLoading(false);
+      }
+      refreshInProgressRef.current = false;
+    }
+  }, [loadDashboardData, onRefresh]);
+
+  const refreshFromAws = useCallback(async (showLoader = false) => {
+    if (refreshInProgressRef.current) {
+      return;
+    }
+
+    refreshInProgressRef.current = true;
+
+    if (showLoader) {
+      setLoading(true);
+    }
+
+    try {
+      try {
+        await fetchMetrics();
+      } catch (error) {
+        console.error('Failed to fetch live AWS metrics:', error);
+      }
+
+      await loadDashboardData();
+      await onRefresh?.();
+    } catch (error) {
+      console.error('Failed to auto-refresh dashboard:', error);
+    } finally {
+      if (showLoader) {
+        setLoading(false);
+      }
+      refreshInProgressRef.current = false;
+    }
+  }, [loadDashboardData, onRefresh]);
+
+  useEffect(() => {
+    refreshFromAws(false);
+  }, [refreshFromAws]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      refreshFromAws(false);
+    }, LIVE_FETCH_INTERVAL_MS);
+
+    return () => clearInterval(interval);
+  }, [refreshFromAws]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      refreshView(false);
+    }, UI_REFRESH_INTERVAL_MS);
+
+    return () => clearInterval(interval);
+  }, [refreshView]);
 
   const handleRefresh = async () => {
-    setLoading(true);
-    try {
-      await fetchMetrics();
-      await loadDashboardData();
-      onRefresh?.();
-    } catch (error) {
-      console.error('Failed to refresh:', error);
-    } finally {
-      setLoading(false);
-    }
+    await refreshFromAws(true);
   };
 
   return (
@@ -162,7 +257,7 @@ export default function Dashboard({ status, onRefresh }) {
             </span>
           </button>
           <button
-            onClick={loadDashboardData}
+            onClick={() => refreshView(true)}
             disabled={loading}
             className="toolbar-button disabled:opacity-50"
           >
@@ -185,7 +280,7 @@ export default function Dashboard({ status, onRefresh }) {
         <MetricCard
           title="Anomalies Detected"
           value={status?.recentAnomalies || 0}
-          unit="last hour"
+          unit="last 24h"
           icon={AlertTriangle}
           color="orange"
         />
@@ -210,7 +305,7 @@ export default function Dashboard({ status, onRefresh }) {
           <div className="flex items-center justify-between mb-4">
             <div>
               <h3 className="text-lg font-semibold text-apple-gray-800">Usage Trend</h3>
-              <p className="text-sm text-apple-gray-500 mt-1">Hourly CPU and network activity for the last 24 hours.</p>
+              <p className="text-sm text-apple-gray-500 mt-1">Minute-level CPU and network activity (auto-updates every few seconds).</p>
             </div>
           </div>
 

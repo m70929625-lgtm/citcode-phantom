@@ -1,14 +1,20 @@
 const { queryAll, queryOne, runSql } = require('../config/database');
 const loggerService = require('./loggerService');
+const userSettingsService = require('./userSettingsService');
 const mlModel = require('../ml/model');
 
 let model = null;
 let modelStats = null;
 let modelLoaded = false;
 
-function getAnomalyThreshold() {
-    const threshold = parseFloat(queryOne('SELECT value FROM settings WHERE key = ?', ['anomaly_threshold'])?.value || 0.5);
-    return Number.isFinite(threshold) ? threshold : 0.5;
+function getAnomalyThreshold(userId = null) {
+    const threshold = parseFloat(userSettingsService.getUserSetting(userId, 'anomaly_threshold', { allowGlobalFallback: true }) || 0.5);
+
+    if (!Number.isFinite(threshold)) {
+        return 0.5;
+    }
+
+    return Math.min(Math.max(threshold, 0.1), 0.95);
 }
 
 async function loadModel() {
@@ -67,21 +73,23 @@ function trainModel(features) {
     }
 }
 
-function detectAnomaly(features, threshold = null) {
-    const anomalyThreshold = typeof threshold === 'number' ? threshold : getAnomalyThreshold();
+function detectAnomaly(features, threshold = null, userId = null) {
+    const anomalyThreshold = typeof threshold === 'number' ? threshold : getAnomalyThreshold(userId);
 
     try {
+        const heuristicResult = statisticalAnomalyDetection(features);
         let result;
 
         if (!model) {
-            result = statisticalAnomalyDetection(features);
+            result = heuristicResult;
         } else {
             const prediction = mlModel.predict(model, features);
 
             result = {
-                anomalyScore: prediction.score,
-                confidence: prediction.confidence || 0.8,
-                features: features
+                anomalyScore: Math.max(prediction.score || 0, heuristicResult.anomalyScore),
+                confidence: Math.max(prediction.confidence || 0.8, heuristicResult.confidence),
+                features: features,
+                reasons: heuristicResult.reasons
             };
         }
 
@@ -128,29 +136,44 @@ function statisticalAnomalyDetection(features) {
     let reasons = [];
 
     if (cpu < 5) {
-        score += 0.3;
+        score += 0.5;
         reasons.push('Very low CPU usage');
     } else if (cpu > 90) {
-        score += 0.4;
+        score += 0.5;
         reasons.push('Very high CPU usage');
     }
 
     if (networkIn === 0 && networkOut === 0) {
-        score += 0.35;
+        score += 0.4;
         reasons.push('No network activity');
+    } else if (networkIn < 1000 && networkOut < 1000) {
+        score += 0.4;
+        reasons.push('Minimal network activity');
     }
 
     const hour = features.hour || new Date().getHours();
     if (hour >= 22 || hour <= 6) {
-        if (cpu > 20) {
+        if (cpu < 15 && networkIn < 2000 && networkOut < 2000) {
+            score += 0.2;
+            reasons.push('Idle during off-hours');
+        } else if (cpu > 20) {
             score += 0.15;
             reasons.push('Active during off-hours');
         }
     }
 
+    let confidence = 0.7;
+    if (score >= 0.9) {
+        confidence = 0.95;
+    } else if (score >= 0.7) {
+        confidence = 0.88;
+    } else if (score >= 0.5) {
+        confidence = 0.8;
+    }
+
     return {
         anomalyScore: Math.min(score, 1),
-        confidence: 0.7,
+        confidence,
         features: features,
         reasons: reasons
     };

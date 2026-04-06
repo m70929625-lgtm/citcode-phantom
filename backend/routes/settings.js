@@ -1,21 +1,27 @@
 const express = require('express');
 const router = express.Router();
-const { queryAll, queryOne, runSql } = require('../config/database');
 const awsService = require('../services/awsService');
 const automationService = require('../services/automationService');
+const metricCollector = require('../services/metricCollector');
 const loggerService = require('../services/loggerService');
+const userSettingsService = require('../services/userSettingsService');
+const cryptoService = require('../services/cryptoService');
+
+const MIN_METRIC_INTERVAL_MS = 30000;
+const MAX_METRIC_INTERVAL_MS = 15 * 60 * 1000;
 
 // GET /api/settings - Get all settings
 router.get('/', (req, res) => {
     try {
-        const settings = queryAll('SELECT * FROM settings');
-
-        const settingsObj = {};
-        for (const s of settings) {
-            settingsObj[s.key] = s.value;
-        }
-
-        delete settingsObj.aws_secret_access_key;
+        const userId = req.session.userId;
+        const settingsObj = {
+            dry_run: userSettingsService.getUserSetting(userId, 'dry_run', { allowGlobalFallback: true }),
+            anomaly_threshold: userSettingsService.getUserSetting(userId, 'anomaly_threshold', { allowGlobalFallback: true }),
+            metric_interval: userSettingsService.getUserSetting(userId, 'metric_interval', { allowGlobalFallback: true }),
+            aws_region: userSettingsService.getUserSetting(userId, 'aws_region', { allowGlobalFallback: true }),
+            automation_level: userSettingsService.getUserSetting(userId, 'automation_level', { allowGlobalFallback: true }),
+            system_status: userSettingsService.getUserSetting(userId, 'system_status', { allowGlobalFallback: true })
+        };
 
         res.json({
             dryRun: settingsObj.dry_run === 'true',
@@ -34,37 +40,58 @@ router.get('/', (req, res) => {
 // PUT /api/settings - Update settings
 router.put('/', async (req, res) => {
     try {
+        const userId = req.session.userId;
         const allowedKeys = [
             'dry_run', 'anomaly_threshold', 'metric_interval',
             'aws_region', 'automation_level', 'system_status'
         ];
 
         let shouldRefreshAws = false;
+        let shouldRestartCollector = false;
 
         for (const [key, value] of Object.entries(req.body)) {
             if (allowedKeys.includes(key)) {
-                runSql(`
-                    INSERT OR REPLACE INTO settings (key, value, updated_at)
-                    VALUES (?, ?, ?)
-                `, [key, String(value), new Date().toISOString()]);
+                if (key === 'metric_interval') {
+                    const parsedInterval = parseInt(value, 10);
+
+                    if (!Number.isFinite(parsedInterval)) {
+                        return res.status(400).json({ error: 'Metric interval must be a number in milliseconds' });
+                    }
+
+                    if (parsedInterval < MIN_METRIC_INTERVAL_MS || parsedInterval > MAX_METRIC_INTERVAL_MS) {
+                        return res.status(400).json({
+                            error: `Metric interval must be between ${MIN_METRIC_INTERVAL_MS} and ${MAX_METRIC_INTERVAL_MS} milliseconds`
+                        });
+                    }
+                }
+
+                userSettingsService.setUserSetting(userId, key, String(value));
 
                 if (key === 'aws_region') {
                     shouldRefreshAws = true;
+                }
+
+                if (key === 'metric_interval') {
+                    shouldRestartCollector = true;
                 }
             }
         }
 
         if (req.body.dry_run !== undefined) {
-            automationService.setDryRun(req.body.dry_run);
+            automationService.setDryRun(userId, req.body.dry_run);
         }
 
         if (req.body.automation_level !== undefined) {
-            automationService.setAutomationLevel(req.body.automation_level);
+            automationService.setAutomationLevel(userId, req.body.automation_level);
         }
 
         if (shouldRefreshAws) {
-            awsService.refreshClients();
-            await awsService.testConnection();
+            awsService.refreshClients(userId);
+            await awsService.testConnection(userId);
+        }
+
+        if (shouldRestartCollector) {
+            metricCollector.restart();
         }
 
         loggerService.info('api', 'Settings updated', req.body);
@@ -72,7 +99,7 @@ router.put('/', async (req, res) => {
         res.json({
             success: true,
             message: 'Settings updated',
-            awsConnected: awsService.isConnected
+            awsConnected: awsService.getConnectionState(userId)
         });
     } catch (error) {
         loggerService.error('api', 'Failed to update settings', { error: error.message });
@@ -83,27 +110,24 @@ router.put('/', async (req, res) => {
 // POST /api/settings/aws-credentials - Set AWS credentials
 router.post('/aws-credentials', async (req, res) => {
     try {
+        const userId = req.session.userId;
         const { accessKeyId, secretAccessKey, region } = req.body;
 
         if (!accessKeyId || !secretAccessKey) {
             return res.status(400).json({ error: 'Access key and secret are required' });
         }
 
-        runSql(`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('aws_access_key_id', ?, ?)`,
-            [accessKeyId, new Date().toISOString()]);
-
-        runSql(`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('aws_secret_access_key', ?, ?)`,
-            [secretAccessKey, new Date().toISOString()]);
+        userSettingsService.setUserSetting(userId, 'aws_access_key_id', cryptoService.encryptText(accessKeyId));
+        userSettingsService.setUserSetting(userId, 'aws_secret_access_key', cryptoService.encryptText(secretAccessKey));
 
         if (region) {
-            runSql(`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('aws_region', ?, ?)`,
-                [region, new Date().toISOString()]);
+            userSettingsService.setUserSetting(userId, 'aws_region', region);
         }
 
-        awsService.refreshClients();
-        const awsConnected = await awsService.testConnection();
+        awsService.refreshClients(userId);
+        const awsConnected = await awsService.testConnection(userId);
 
-        loggerService.info('api', 'AWS credentials updated');
+        loggerService.info('api', 'AWS credentials updated', { userId });
 
         res.json({
             success: true,

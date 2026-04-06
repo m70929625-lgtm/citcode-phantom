@@ -6,10 +6,11 @@ const loggerService = require('../services/loggerService');
 // GET /api/anomalies - Get detected anomalies
 router.get('/', (req, res) => {
     try {
+        const userId = req.session.userId;
         const { status, minScore, limit = 100 } = req.query;
 
-        let query = 'SELECT * FROM anomalies WHERE 1=1';
-        const params = [];
+        let query = 'SELECT * FROM anomalies WHERE user_id = ?';
+        const params = [userId];
 
         if (status) {
             query += ' AND status = ?';
@@ -33,7 +34,8 @@ router.get('/', (req, res) => {
                 SUM(CASE WHEN status = 'acknowledged' THEN 1 ELSE 0 END) as acknowledged_count,
                 SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) as resolved_count
             FROM anomalies
-        `);
+            WHERE user_id = ?
+        `, [userId]);
 
         res.json({
             data: data.map(a => ({
@@ -68,13 +70,14 @@ router.get('/', (req, res) => {
 // GET /api/anomalies/:id - Get single anomaly
 router.get('/:id', (req, res) => {
     try {
-        const anomaly = queryOne('SELECT * FROM anomalies WHERE id = ?', [req.params.id]);
+        const userId = req.session.userId;
+        const anomaly = queryOne('SELECT * FROM anomalies WHERE id = ? AND user_id = ?', [req.params.id, userId]);
 
         if (!anomaly) {
             return res.status(404).json({ error: 'Anomaly not found' });
         }
 
-        const actions = queryAll('SELECT * FROM actions WHERE anomaly_id = ?', [req.params.id]);
+        const actions = queryAll('SELECT * FROM actions WHERE anomaly_id = ? AND user_id = ?', [req.params.id, userId]);
 
         res.json({
             id: anomaly.id,
@@ -107,6 +110,7 @@ router.get('/:id', (req, res) => {
 // PATCH /api/anomalies/:id - Update anomaly status
 router.patch('/:id', (req, res) => {
     try {
+        const userId = req.session.userId;
         const { status } = req.body;
 
         if (!['new', 'acknowledged', 'resolved'].includes(status)) {
@@ -114,8 +118,8 @@ router.patch('/:id', (req, res) => {
         }
 
         const result = runSql(`
-            UPDATE anomalies SET status = ?, updated_at = ? WHERE id = ?
-        `, [status, new Date().toISOString(), req.params.id]);
+            UPDATE anomalies SET status = ?, updated_at = ? WHERE id = ? AND user_id = ?
+        `, [status, new Date().toISOString(), req.params.id, userId]);
 
         if (result.changes === 0) {
             return res.status(404).json({ error: 'Anomaly not found' });
@@ -123,7 +127,7 @@ router.patch('/:id', (req, res) => {
 
         loggerService.info('api', `Anomaly ${req.params.id} status updated to ${status}`);
 
-        const updated = queryOne('SELECT * FROM anomalies WHERE id = ?', [req.params.id]);
+        const updated = queryOne('SELECT * FROM anomalies WHERE id = ? AND user_id = ?', [req.params.id, userId]);
         res.json({ success: true, anomaly: updated });
     } catch (error) {
         loggerService.error('api', 'Failed to update anomaly', { error: error.message });

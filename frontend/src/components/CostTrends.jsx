@@ -1,37 +1,160 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { RefreshCw, IndianRupee, TrendingUp, PieChart, AlertTriangle, ScanLine, CheckCircle } from 'lucide-react';
 import GlassCard from './GlassCard';
 import { AreaChart, Area, PieChart as RechartsPie, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
-import { getCosts, detectCostAnomalies } from '../hooks/useApi';
+import { getCosts, getLiveCosts, fetchLiveCostSample, detectCostAnomalies } from '../hooks/useApi';
 import { formatCurrency, formatDateShort } from '../utils/formatters';
 
 const COLORS = ['#0071e3', '#34c759', '#ff9500', '#ff3b30', '#5856d6', '#af52de'];
+const LIVE_COST_WINDOW_MINUTES = 90;
+const LIVE_FETCH_INTERVAL_MS = 60000;
+const VIEW_REFRESH_INTERVAL_MS = 10000;
 
-export default function CostTrends() {
+function mapWindowToCostPeriod(windowValue) {
+  if (windowValue === '7d') return '7d';
+  if (windowValue === '90d') return '90d';
+  return '30d';
+}
+
+function buildLiveCostTrend(points) {
+  return (points || [])
+    .map((point) => {
+      const date = new Date(point.timestamp);
+      if (Number.isNaN(date.getTime())) {
+        return null;
+      }
+
+      return {
+        timestamp: point.timestamp,
+        time: new Intl.DateTimeFormat('en-IN', {
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: false
+        }).format(date),
+        cost: point.cost || 0,
+        isEstimated: Boolean(point.isEstimated)
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+}
+
+export default function CostTrends({ filters = {} }) {
   const [costData, setCostData] = useState(null);
+  const [liveCostData, setLiveCostData] = useState(null);
+  const [liveTrend, setLiveTrend] = useState([]);
   const [period, setPeriod] = useState('30d');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [detectingAnomalies, setDetectingAnomalies] = useState(false);
   const [detectionResult, setDetectionResult] = useState(null);
+  const refreshInProgressRef = useRef(false);
 
-  useEffect(() => {
-    loadCostData();
+  const loadCostData = useCallback(async () => {
+    const data = await getCosts(period);
+    setCostData(data);
+    return data;
   }, [period]);
 
-  const loadCostData = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await getCosts(period);
-      setCostData(data);
-    } catch (error) {
-      console.error('Failed to load cost data:', error);
-      setError(error.message || 'Failed to load live AWS cost data');
-    } finally {
-      setLoading(false);
+  const loadLiveCostData = useCallback(async () => {
+    const data = await getLiveCosts(`${LIVE_COST_WINDOW_MINUTES}m`);
+    setLiveCostData(data);
+    setLiveTrend(buildLiveCostTrend(data.points || []));
+    return data;
+  }, []);
+
+  const refreshCostView = useCallback(async (showLoader = false) => {
+    if (refreshInProgressRef.current) {
+      return;
     }
-  };
+
+    refreshInProgressRef.current = true;
+
+    if (showLoader) {
+      setLoading(true);
+    }
+
+    try {
+      setError(null);
+      await Promise.all([
+        loadCostData(),
+        loadLiveCostData()
+      ]);
+    } catch (requestError) {
+      console.error('Failed to refresh cost view:', requestError);
+      setError(requestError.message || 'Failed to load live AWS cost data');
+    } finally {
+      if (showLoader) {
+        setLoading(false);
+      }
+      refreshInProgressRef.current = false;
+    }
+  }, [loadCostData, loadLiveCostData]);
+
+  const refreshFromAws = useCallback(async (showLoader = false) => {
+    if (refreshInProgressRef.current) {
+      return;
+    }
+
+    refreshInProgressRef.current = true;
+
+    if (showLoader) {
+      setLoading(true);
+    }
+
+    try {
+      setError(null);
+      try {
+        await fetchLiveCostSample();
+      } catch (fetchError) {
+        console.error('Failed to fetch fresh live AWS cost sample:', fetchError);
+      }
+
+      await Promise.all([
+        loadCostData(),
+        loadLiveCostData()
+      ]);
+    } catch (requestError) {
+      console.error('Failed to refresh costs from AWS:', requestError);
+      setError(requestError.message || 'Failed to load live AWS cost data');
+    } finally {
+      if (showLoader) {
+        setLoading(false);
+      }
+      refreshInProgressRef.current = false;
+    }
+  }, [loadCostData, loadLiveCostData]);
+
+  useEffect(() => {
+    refreshCostView(true);
+  }, [period, refreshCostView]);
+
+  useEffect(() => {
+    const mappedPeriod = mapWindowToCostPeriod(filters.window);
+    if (mappedPeriod !== period) {
+      setPeriod(mappedPeriod);
+    }
+  }, [filters.window]);
+
+  useEffect(() => {
+    refreshFromAws(false);
+  }, [refreshFromAws]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      refreshFromAws(false);
+    }, LIVE_FETCH_INTERVAL_MS);
+
+    return () => clearInterval(interval);
+  }, [refreshFromAws]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      refreshCostView(false);
+    }, VIEW_REFRESH_INTERVAL_MS);
+
+    return () => clearInterval(interval);
+  }, [refreshCostView]);
 
   const handleDetectAnomalies = async () => {
     setDetectingAnomalies(true);
@@ -39,8 +162,7 @@ export default function CostTrends() {
     try {
       const result = await detectCostAnomalies();
       setDetectionResult(result);
-      // Refresh cost data to show updated anomalies
-      await loadCostData();
+      await refreshFromAws(false);
     } catch (error) {
       console.error('Failed to detect anomalies:', error);
       setDetectionResult({ error: error.message });
@@ -55,19 +177,38 @@ export default function CostTrends() {
     { value: '90d', label: '90 Days' },
   ];
 
+  const sourceCurrency = liveCostData?.sourceCurrency || costData?.sourceCurrency || 'USD';
+  const displayCurrency = liveCostData?.displayCurrency || costData?.displayCurrency || (sourceCurrency === 'USD' ? 'INR' : sourceCurrency);
+  const shouldConvertFromUsd = displayCurrency === 'INR' && sourceCurrency === 'USD';
+
   const formatDisplayCost = (amount, decimals = 2) => {
-    if (!costData) return formatCurrency(amount, 'INR', decimals);
-
-    if (costData.displayCurrency === 'INR' && costData.sourceCurrency === 'USD') {
-      return formatCurrency(amount, 'INR', decimals, { convertFromUsd: true });
-    }
-
-    return formatCurrency(amount, costData.displayCurrency || costData.sourceCurrency || 'INR', decimals, {
-      convertFromUsd: false
+    return formatCurrency(amount, displayCurrency, decimals, {
+      convertFromUsd: shouldConvertFromUsd
     });
   };
 
-  const pieData = (costData?.serviceBreakdown || [])
+  const formatLiveDisplayCost = (amount, decimals = 4) => {
+    return formatCurrency(amount, displayCurrency, decimals, {
+      convertFromUsd: shouldConvertFromUsd
+    });
+  };
+
+  const serviceBreakdown = (costData?.serviceBreakdown || []).filter((service) => {
+    if (!filters.service || filters.service === 'all') {
+      return true;
+    }
+    return service.serviceName === filters.service;
+  });
+
+  const filteredTotalCost = serviceBreakdown.reduce((sum, service) => sum + (service.amount || 0), 0);
+  const totalCostValue = filters.service && filters.service !== 'all'
+    ? filteredTotalCost
+    : costData?.totalCost || 0;
+  const projectedMonthlyValue = filters.service && filters.service !== 'all'
+    ? (totalCostValue / Math.max(parseInt(period, 10), 1)) * 30
+    : costData?.projectedMonthly || 0;
+
+  const pieData = serviceBreakdown
     .slice(0, 5)
     .map((service) => ({
       name: service.serviceName,
@@ -83,13 +224,16 @@ export default function CostTrends() {
           <p className="section-kicker">Costs</p>
           <h2 className="mt-3 text-3xl font-semibold tracking-[-0.04em] text-apple-gray-800">Cost Analysis</h2>
           <p className="mt-2 text-base text-apple-gray-500">
-            Review live AWS billing data, daily trends and service-level breakdown for the selected period.
+            Review live AWS billing data, real-time trend updates and service-level breakdown for the selected period.
+          </p>
+          <p className="mt-2 text-sm text-apple-gray-400">
+            Real-time graph refreshes automatically every 10s, with a fresh AWS cost sample captured every 60s.
           </p>
           {costData?.source === 'aws_cost_explorer' && (
             <p className="mt-2 text-sm text-apple-gray-400">
-              {costData.displayCurrency !== costData.sourceCurrency
-                ? `Showing approximate INR values converted from AWS Cost Explorer ${costData.sourceCurrency} billing data.`
-                : `Showing live AWS Cost Explorer values in ${costData.sourceCurrency}.`}
+              {displayCurrency !== sourceCurrency
+                ? `Showing approximate ${displayCurrency} values converted from AWS Cost Explorer ${sourceCurrency} billing data.`
+                : `Showing live AWS Cost Explorer values in ${sourceCurrency}.`}
             </p>
           )}
           {costData?.source === 'resource_count_heuristic' && (
@@ -135,7 +279,7 @@ export default function CostTrends() {
             </span>
           </button>
           <button
-            onClick={loadCostData}
+            onClick={() => refreshFromAws(true)}
             disabled={loading}
             className="toolbar-button disabled:opacity-50"
           >
@@ -198,9 +342,9 @@ export default function CostTrends() {
                 <span className="text-sm text-apple-gray-500">Total {period.replace('d', ' days')}</span>
               </div>
               <p className="text-3xl font-bold text-apple-gray-800 tabular-nums">
-                {formatDisplayCost(costData.totalCost)}
+                {formatDisplayCost(totalCostValue)}
               </p>
-              <p className="text-sm text-apple-gray-400 mt-1">projected monthly: {formatDisplayCost(costData.projectedMonthly)}</p>
+              <p className="text-sm text-apple-gray-400 mt-1">projected monthly: {formatDisplayCost(projectedMonthlyValue)}</p>
             </GlassCard>
 
             <GlassCard className="p-6">
@@ -211,7 +355,7 @@ export default function CostTrends() {
                 <span className="text-sm text-apple-gray-500">Daily Average</span>
               </div>
               <p className="text-3xl font-bold text-apple-gray-800 tabular-nums">
-                {formatDisplayCost(costData.totalCost / parseInt(period, 10) || 0)}
+                {formatDisplayCost(totalCostValue / parseInt(period, 10) || 0)}
               </p>
               <p className="text-sm text-apple-gray-400 mt-1">cost per day</p>
             </GlassCard>
@@ -234,10 +378,11 @@ export default function CostTrends() {
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             {/* Cost Trend */}
             <GlassCard className="lg:col-span-2 p-6">
-              <h3 className="text-lg font-semibold text-apple-gray-800 mb-4">Cost Trend</h3>
-              {costData.trends && costData.trends.length > 0 ? (
+              <h3 className="text-lg font-semibold text-apple-gray-800 mb-1">Live Cost Trend</h3>
+              <p className="text-sm text-apple-gray-500 mb-4">Minute-level running AWS cost for the last {LIVE_COST_WINDOW_MINUTES} minutes.</p>
+              {liveTrend.length > 0 ? (
                 <ResponsiveContainer width="100%" height={300}>
-                  <AreaChart data={costData.trends}>
+                  <AreaChart data={liveTrend}>
                     <defs>
                       <linearGradient id="costGradient" x1="0" y1="0" x2="0" y2="1">
                         <stop offset="5%" stopColor="#0071e3" stopOpacity={0.2}/>
@@ -246,19 +391,18 @@ export default function CostTrends() {
                     </defs>
                     <CartesianGrid strokeDasharray="3 3" stroke="#e8e8ed" />
                     <XAxis
-                      dataKey="date"
-                      tickFormatter={(val) => formatDateShort(val)}
+                      dataKey="time"
                       stroke="#86868b"
                       fontSize={12}
                     />
                     <YAxis
-                      tickFormatter={(val) => formatDisplayCost(val, 0)}
+                      tickFormatter={(val) => formatLiveDisplayCost(val, 2)}
                       stroke="#86868b"
                       fontSize={12}
                     />
                     <Tooltip
-                      formatter={(value) => [formatDisplayCost(value), 'Cost']}
-                      labelFormatter={(label) => formatDateShort(label)}
+                      formatter={(value) => [formatLiveDisplayCost(value), 'Cost']}
+                      labelFormatter={(label, payload) => payload?.[0]?.payload?.timestamp || label}
                       contentStyle={{
                         backgroundColor: 'rgba(255, 255, 255, 0.95)',
                         border: '1px solid #e8e8ed',
@@ -277,7 +421,7 @@ export default function CostTrends() {
                 </ResponsiveContainer>
               ) : (
                 <div className="flex items-center justify-center h-[300px] text-apple-gray-400">
-                  No trend data available
+                  No live trend data available yet
                 </div>
               )}
             </GlassCard>

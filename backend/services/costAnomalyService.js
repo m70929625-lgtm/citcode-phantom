@@ -21,16 +21,16 @@ const MIN_COST_FOR_ANOMALY = 10; // Minimum $10 to trigger
 /**
  * Detect cost anomalies by comparing today's cost against historical average
  */
-async function detectCostAnomalies() {
+async function detectCostAnomalies(userId) {
     try {
-        loggerService.info('cost-anomaly', 'Starting cost anomaly detection...');
+        loggerService.info('cost-anomaly', 'Starting cost anomaly detection...', { userId });
 
         const today = new Date();
         const sevenDaysAgo = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
         const thirtyDaysAgo = new Date(today.getTime() - 30 * 24 * 60 * 60 * 1000);
 
         // Fetch cost data for the last 30 days
-        const costData = await fetchCostData(thirtyDaysAgo, today);
+        const costData = await fetchCostData(thirtyDaysAgo, today, userId);
         
         if (!costData || costData.length === 0) {
             loggerService.info('cost-anomaly', 'No cost data available for analysis');
@@ -105,14 +105,14 @@ async function detectCostAnomalies() {
 
         // Process detected anomalies
         for (const anomaly of anomalies) {
-            await processCostAnomaly(anomaly);
+            await processCostAnomaly(anomaly, userId);
         }
 
-        loggerService.info('cost-anomaly', `Detected ${anomalies.length} cost anomalies`);
+        loggerService.info('cost-anomaly', `Detected ${anomalies.length} cost anomalies`, { userId });
         return anomalies;
 
     } catch (error) {
-        loggerService.error('cost-anomaly', 'Cost anomaly detection failed', { error: error.message });
+        loggerService.error('cost-anomaly', 'Cost anomaly detection failed', { error: error.message, userId });
         return [];
     }
 }
@@ -120,7 +120,7 @@ async function detectCostAnomalies() {
 /**
  * Fetch cost data from AWS Cost Explorer
  */
-async function fetchCostData(startDate, endDate) {
+async function fetchCostData(startDate, endDate, userId) {
     try {
         const formatDate = (date) => date.toISOString().slice(0, 10);
         
@@ -129,7 +129,7 @@ async function fetchCostData(startDate, endDate) {
             endDate: formatDate(endDate),
             granularity: 'DAILY',
             groupBy: ['SERVICE']
-        });
+        }, userId);
 
         const results = [];
         for (const entry of response.ResultsByTime || []) {
@@ -148,17 +148,17 @@ async function fetchCostData(startDate, endDate) {
 
         return results;
     } catch (error) {
-        loggerService.warn('cost-anomaly', 'Failed to fetch cost data, using heuristic', { error: error.message });
+        loggerService.warn('cost-anomaly', 'Failed to fetch cost data, using heuristic', { error: error.message, userId });
         
         // Fallback to estimated costs from metrics
-        return getEstimatedCostData(startDate, endDate);
+        return getEstimatedCostData(startDate, endDate, userId);
     }
 }
 
 /**
  * Get estimated cost data from resource metrics
  */
-function getEstimatedCostData(startDate, endDate) {
+function getEstimatedCostData(startDate, endDate, userId) {
     const dailyCosts = [];
     const metrics = queryAll(`
         SELECT 
@@ -166,9 +166,9 @@ function getEstimatedCostData(startDate, endDate) {
             resource_type,
             COUNT(DISTINCT resource_id) as resource_count
         FROM metrics
-        WHERE timestamp >= ? AND timestamp <= ?
+        WHERE user_id = ? AND timestamp >= ? AND timestamp <= ?
         GROUP BY date(timestamp), resource_type
-    `, [startDate.toISOString(), endDate.toISOString()]);
+    `, [userId, startDate.toISOString(), endDate.toISOString()]);
 
     const monthlyCostByType = {
         'EC2': 24,
@@ -287,15 +287,15 @@ async function detectServiceLevelAnomalies(costData, dates) {
 /**
  * Process a detected cost anomaly - create anomaly record and action
  */
-async function processCostAnomaly(anomaly) {
+async function processCostAnomaly(anomaly, userId) {
     try {
         // Check if similar anomaly already exists (within last hour)
         const existingAnomaly = queryOne(`
             SELECT * FROM anomalies
-            WHERE resource_id = ? AND status = 'new'
+            WHERE user_id = ? AND resource_id = ? AND status = 'new'
             AND anomaly_type LIKE 'COST%'
             AND detected_at > datetime('now', '-1 hour')
-        `, [anomaly.resourceId]);
+        `, [userId, anomaly.resourceId]);
 
         if (existingAnomaly) {
             loggerService.info('cost-anomaly', 'Similar cost anomaly already exists, skipping', { 
@@ -307,12 +307,13 @@ async function processCostAnomaly(anomaly) {
         // Insert anomaly into database
         runSql(`
             INSERT INTO anomalies (
-                id, resource_id, resource_name, resource_type,
+                id, user_id, resource_id, resource_name, resource_type,
                 anomaly_type, detected_at, anomaly_score, confidence,
                 features, recommended_action, estimated_savings, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `, [
             anomaly.id,
+            userId,
             anomaly.resourceId,
             anomaly.resourceName,
             anomaly.resourceType,
@@ -330,13 +331,13 @@ async function processCostAnomaly(anomaly) {
             'warn',
             'anomaly',
             `Cost anomaly detected: ${anomaly.type} for ${anomaly.resourceName}`,
-            { score: anomaly.score, confidence: anomaly.confidence, savings: anomaly.estimatedSavings },
+            { score: anomaly.score, confidence: anomaly.confidence, savings: anomaly.estimatedSavings, userId },
             anomaly.resourceId,
             anomaly.recommendedAction
         );
 
         // Alert about the anomaly
-        alertService.alertAnomalyDetected({
+        alertService.alertAnomalyDetected(userId, {
             id: anomaly.id,
             type: anomaly.type,
             resourceId: anomaly.resourceId,
@@ -353,13 +354,14 @@ async function processCostAnomaly(anomaly) {
             anomaly.resourceName,
             'SEND_ALERT',
             anomaly.estimatedSavings,
-            anomaly.confidence
+            anomaly.confidence,
+            userId
         );
 
         if (actionId) {
             // Auto-approve and execute alert actions for cost anomalies
             try {
-                automationService.approveAction(actionId, 'system:auto-cost');
+                automationService.approveAction(actionId, 'system:auto-cost', userId);
                 await automationService.executeAction(actionId);
                 
                 loggerService.info('cost-anomaly', `Cost alert action executed: ${actionId}`, {
@@ -369,10 +371,17 @@ async function processCostAnomaly(anomaly) {
 
                 // Send notification that action was taken
                 const executedAction = queryOne('SELECT * FROM actions WHERE id = ?', [actionId]);
-                alertService.alertActionExecuted(executedAction);
+                alertService.alertActionExecuted(userId, {
+                    id: executedAction.id,
+                    actionType: executedAction.action_type,
+                    resourceId: executedAction.resource_id,
+                    resourceName: executedAction.resource_name,
+                    savings: executedAction.savings
+                });
             } catch (actionError) {
                 loggerService.error('cost-anomaly', 'Failed to execute cost alert action', {
                     actionId,
+                    userId,
                     error: actionError.message
                 });
             }
@@ -383,6 +392,7 @@ async function processCostAnomaly(anomaly) {
     } catch (error) {
         loggerService.error('cost-anomaly', 'Failed to process cost anomaly', { 
             error: error.message,
+            userId,
             anomalyId: anomaly.id 
         });
     }

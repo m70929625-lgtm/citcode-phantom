@@ -2,6 +2,7 @@ const API_BASE = '/api';
 
 export async function fetchApi(endpoint, options = {}) {
   const response = await fetch(`${API_BASE}${endpoint}`, {
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
       ...options.headers,
@@ -63,6 +64,7 @@ export const getActions = (params = {}) => {
   return fetchApi(`/actions${query ? `?${query}` : ''}`);
 };
 export const getPendingActions = () => fetchApi('/actions/pending');
+export const getAction = (id) => fetchApi(`/actions/${id}`);
 export const approveAction = (id, approver = 'admin') => fetchApi(`/actions/${id}/approve`, {
   method: 'POST',
   body: JSON.stringify({ approver }),
@@ -90,4 +92,29 @@ export const acknowledgeAllAlerts = () => fetchApi('/alerts/acknowledge-all', { 
 
 // Costs
 export const getCosts = (period = '30d') => fetchApi(`/costs?period=${period}`);
+export const getLiveCosts = (window = '90m') => fetchApi(`/costs/live?window=${window}`);
+export const fetchLiveCostSample = () => fetchApi('/costs/live/fetch', { method: 'POST' });
 export const detectCostAnomalies = () => fetchApi('/costs/detect-anomalies', { method: 'POST' });
+
+// Saved Views
+export const getSavedViews = () => fetchApi('/views');
+export const createSavedView = (payload) => fetchApi('/views', {
+  method: 'POST',
+  body: JSON.stringify(payload)
+});
+export const updateSavedView = (id, payload) => fetchApi(`/views/${id}`, {
+  method: 'PUT',
+  body: JSON.stringify(payload)
+});
+export const deleteSavedView = (id) => fetchApi(`/views/${id}`, { method: 'DELETE' });
+
+// Reports
+export const getReportSummary = (params = {}) => {
+  const query = new URLSearchParams(params).toString();
+  return fetchApi(`/reports/summary${query ? `?${query}` : ''}`);
+};
+export const createReportJob = (payload) => fetchApi('/reports/jobs', {
+  method: 'POST',
+  body: JSON.stringify(payload)
+});
+export const getReportJobs = (limit = 20) => fetchApi(`/reports/jobs?limit=${limit}`);

@@ -62,6 +62,38 @@ export function AuthProvider({ children }) {
         return data;
     };
 
+    const forgotPassword = async (email) => {
+        const res = await fetch('/auth/forgot-password', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ email })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            const err = new Error(data.error);
+            err.status = res.status;
+            throw err;
+        }
+        return data;
+    };
+
+    const resetPassword = async (token, password, confirmPassword) => {
+        const res = await fetch('/auth/reset-password', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ token, password, confirmPassword })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            const err = new Error(data.error);
+            err.status = res.status;
+            throw err;
+        }
+        return data;
+    };
+
     const logout = async () => {
         await fetch('/auth/logout', {
             method: 'POST',
@@ -71,7 +103,7 @@ export function AuthProvider({ children }) {
     };
 
     return (
-        <AuthContext.Provider value={{ user, loading, register, login, logout, checkAuth }}>
+        <AuthContext.Provider value={{ user, loading, register, login, forgotPassword, resetPassword, logout, checkAuth }}>
             {children}
         </AuthContext.Provider>
     );

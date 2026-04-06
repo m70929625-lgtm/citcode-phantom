@@ -1,26 +1,44 @@
 import { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import { RefreshCw, AlertTriangle, CheckCircle, Clock, Filter, Bell, Check, X } from 'lucide-react';
 import GlassCard from './GlassCard';
 import AnomalyBadge from './AnomalyBadge';
 import { getAnomalies, updateAnomaly } from '../hooks/useApi';
 import { formatRelativeTime, formatCurrency, formatPercent } from '../utils/formatters';
 
-export default function AnomalyAlerts() {
+function normalizeAnomalyStatus(status) {
+  return ['new', 'acknowledged', 'resolved'].includes(status) ? status : 'all';
+}
+
+export default function AnomalyAlerts({ filters = {} }) {
   const [anomalies, setAnomalies] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [filter, setFilter] = useState('all');
+  const [filter, setFilter] = useState(normalizeAnomalyStatus(filters.status));
   const [selectedAnomaly, setSelectedAnomaly] = useState(null);
 
   useEffect(() => {
+    const nextGlobalStatus = normalizeAnomalyStatus(filters.status);
+    if (nextGlobalStatus !== filter) {
+      setFilter(nextGlobalStatus);
+    }
+  }, [filters.status]);
+
+  useEffect(() => {
     loadAnomalies();
-  }, [filter]);
+  }, [filter, filters.service]);
 
   const loadAnomalies = async () => {
     setLoading(true);
     try {
       const params = filter !== 'all' ? { status: filter } : {};
       const data = await getAnomalies(params);
-      setAnomalies(data.data || []);
+      const filteredData = (data.data || []).filter((anomaly) => {
+        if (!filters.service || filters.service === 'all') {
+          return true;
+        }
+        return anomaly.resourceType === filters.service;
+      });
+      setAnomalies(filteredData);
     } catch (error) {
       console.error('Failed to load anomalies:', error);
     } finally {
@@ -132,7 +150,9 @@ export default function AnomalyAlerts() {
                   <div className="flex items-start justify-between gap-4">
                     <div>
                       <div className="flex items-center gap-2 mb-1">
-                        <span className="font-semibold text-apple-gray-800">{anomaly.resourceName}</span>
+                        <Link to={`/anomalies/${encodeURIComponent(anomaly.id)}`} className="font-semibold text-apple-gray-800 hover:text-apple-blue">
+                          {anomaly.resourceName}
+                        </Link>
                         <AnomalyBadge type={anomaly.type} />
                       </div>
                       <p className="text-sm text-apple-gray-500">

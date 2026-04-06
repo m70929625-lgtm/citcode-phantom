@@ -1,10 +1,35 @@
 const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const { queryOne, runSql } = require('../config/database');
 const { authLimiter, requireAuth } = require('../middleware/auth');
 const loggerService = require('../services/loggerService');
+const userSettingsService = require('../services/userSettingsService');
+
+const RESET_TOKEN_EXPIRY_MINUTES = 15;
+
+function hashResetToken(token) {
+    return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function getResetTokenExpiry() {
+    return new Date(Date.now() + RESET_TOKEN_EXPIRY_MINUTES * 60 * 1000).toISOString();
+}
+
+function getForgotPasswordResponse(resetToken = null) {
+    const response = {
+        message: 'If an account exists for this email, password reset instructions have been generated.'
+    };
+
+    if (resetToken && process.env.NODE_ENV !== 'production') {
+        response.resetToken = resetToken;
+        response.expiresInMinutes = RESET_TOKEN_EXPIRY_MINUTES;
+    }
+
+    return response;
+}
 
 // ============================================
 // ROUTE: Register new account
@@ -45,6 +70,10 @@ router.post('/register', authLimiter, async (req, res) => {
             'INSERT INTO users (id, email, password_hash, auth_provider) VALUES (?, ?, ?, ?)',
             [userId, email.toLowerCase(), passwordHash, 'email']
         );
+
+        Object.entries(userSettingsService.DEFAULT_SETTINGS).forEach(([key, value]) => {
+            userSettingsService.setUserSetting(userId, key, value);
+        });
 
         // Create session
         req.session.userId = userId;
@@ -99,6 +128,100 @@ router.post('/login', authLimiter, async (req, res) => {
     } catch (error) {
         loggerService.error('auth', 'Login failed', { error: error.message });
         res.status(500).json({ error: 'Login failed' });
+    }
+});
+
+// ============================================
+// ROUTE: Request password reset
+// ============================================
+router.post('/forgot-password', authLimiter, async (req, res) => {
+    try {
+        const { email } = req.body;
+
+        if (!email || !email.includes('@')) {
+            return res.status(400).json({ error: 'Valid email is required' });
+        }
+
+        const normalizedEmail = email.toLowerCase();
+        const user = queryOne('SELECT id, email FROM users WHERE email = ?', [normalizedEmail]);
+
+        if (!user) {
+            loggerService.info('auth', 'Password reset requested for unknown email', { email: normalizedEmail });
+            return res.json(getForgotPasswordResponse());
+        }
+
+        const now = new Date().toISOString();
+        runSql('UPDATE password_reset_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL', [now, user.id]);
+
+        const resetToken = crypto.randomBytes(32).toString('hex');
+        const tokenHash = hashResetToken(resetToken);
+
+        runSql(
+            'INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)',
+            [uuidv4(), user.id, tokenHash, getResetTokenExpiry()]
+        );
+
+        loggerService.info('auth', 'Password reset token generated', { email: normalizedEmail });
+
+        res.json(getForgotPasswordResponse(resetToken));
+    } catch (error) {
+        loggerService.error('auth', 'Forgot password request failed', { error: error.message });
+        res.status(500).json({ error: 'Failed to start password reset' });
+    }
+});
+
+// ============================================
+// ROUTE: Reset password using token
+// ============================================
+router.post('/reset-password', authLimiter, async (req, res) => {
+    try {
+        const { token, password, confirmPassword } = req.body;
+
+        if (!token || !password || !confirmPassword) {
+            return res.status(400).json({ error: 'Token, password and confirmation are required' });
+        }
+
+        if (password.length < 8) {
+            return res.status(400).json({ error: 'Password must be at least 8 characters' });
+        }
+
+        if (password !== confirmPassword) {
+            return res.status(400).json({ error: 'Passwords do not match' });
+        }
+
+        const tokenHash = hashResetToken(token);
+        const tokenRecord = queryOne(
+            'SELECT * FROM password_reset_tokens WHERE token_hash = ? AND used_at IS NULL',
+            [tokenHash]
+        );
+
+        if (!tokenRecord) {
+            return res.status(400).json({ error: 'Invalid or expired reset token' });
+        }
+
+        const expiresAt = new Date(tokenRecord.expires_at);
+        if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() <= Date.now()) {
+            runSql('UPDATE password_reset_tokens SET used_at = ? WHERE id = ?', [new Date().toISOString(), tokenRecord.id]);
+            return res.status(400).json({ error: 'Invalid or expired reset token' });
+        }
+
+        const user = queryOne('SELECT id, email FROM users WHERE id = ?', [tokenRecord.user_id]);
+        if (!user) {
+            return res.status(400).json({ error: 'Invalid reset token' });
+        }
+
+        const passwordHash = await bcrypt.hash(password, 12);
+        const now = new Date().toISOString();
+
+        runSql('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?', [passwordHash, now, user.id]);
+        runSql('UPDATE password_reset_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL', [now, user.id]);
+
+        loggerService.info('auth', 'Password reset successful', { email: user.email });
+
+        res.json({ message: 'Password reset successful. Please sign in with your new password.' });
+    } catch (error) {
+        loggerService.error('auth', 'Password reset failed', { error: error.message });
+        res.status(500).json({ error: 'Password reset failed' });
     }
 });
 

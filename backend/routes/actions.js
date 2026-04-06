@@ -7,15 +7,16 @@ const loggerService = require('../services/loggerService');
 // GET /api/actions - Get all actions
 router.get('/', (req, res) => {
     try {
+        const userId = req.session.userId;
         const { status, resourceId, limit = 100 } = req.query;
 
         let query = `
             SELECT a.*, an.anomaly_type 
             FROM actions a
-            LEFT JOIN anomalies an ON a.anomaly_id = an.id
-            WHERE 1=1
+            LEFT JOIN anomalies an ON a.anomaly_id = an.id AND an.user_id = a.user_id
+            WHERE a.user_id = ?
         `;
-        const params = [];
+        const params = [userId];
 
         if (status) {
             query += ' AND a.status = ?';
@@ -64,7 +65,8 @@ router.get('/', (req, res) => {
 // GET /api/actions/pending - Get pending actions
 router.get('/pending', (req, res) => {
     try {
-        const actions = automationService.getPendingActions();
+        const userId = req.session.userId;
+        const actions = automationService.getPendingActions(userId);
 
         res.json({
             data: actions.map(a => ({
@@ -90,7 +92,8 @@ router.get('/pending', (req, res) => {
 // GET /api/actions/:id - Get single action
 router.get('/:id', (req, res) => {
     try {
-        const action = queryOne('SELECT * FROM actions WHERE id = ?', [req.params.id]);
+        const userId = req.session.userId;
+        const action = queryOne('SELECT * FROM actions WHERE id = ? AND user_id = ?', [req.params.id, userId]);
 
         if (!action) {
             return res.status(404).json({ error: 'Action not found' });
@@ -124,8 +127,9 @@ router.get('/:id', (req, res) => {
 // POST /api/actions/:id/approve - Approve an action
 router.post('/:id/approve', (req, res) => {
     try {
+        const userId = req.session.userId;
         const { approver = 'admin' } = req.body;
-        const action = automationService.approveAction(req.params.id, approver);
+        const action = automationService.approveAction(req.params.id, approver, userId);
 
         if (!action) {
             return res.status(404).json({ error: 'Action not found' });
@@ -149,6 +153,12 @@ router.post('/:id/approve', (req, res) => {
 // POST /api/actions/:id/execute - Execute an approved action
 router.post('/:id/execute', async (req, res) => {
     try {
+        const userId = req.session.userId;
+        const action = queryOne('SELECT id FROM actions WHERE id = ? AND user_id = ?', [req.params.id, userId]);
+        if (!action) {
+            return res.status(404).json({ success: false, error: 'Action not found' });
+        }
+
         const result = await automationService.executeAction(req.params.id);
         res.json({
             success: true,
@@ -166,7 +176,8 @@ router.post('/:id/execute', async (req, res) => {
 // POST /api/actions/:id/dismiss - Dismiss an action
 router.post('/:id/dismiss', (req, res) => {
     try {
-        const action = automationService.dismissAction(req.params.id);
+        const userId = req.session.userId;
+        const action = automationService.dismissAction(req.params.id, userId);
 
         if (!action) {
             return res.status(404).json({ error: 'Action not found' });
@@ -188,23 +199,28 @@ router.post('/:id/dismiss', (req, res) => {
 // GET /api/actions/stats/summary - Get action statistics
 router.get('/stats/summary', (req, res) => {
     try {
+        const userId = req.session.userId;
         const stats = queryOne(`
             SELECT
                 COUNT(*) as total,
                 SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
                 SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved,
-                SUM(CASE WHEN status = 'executed' THEN 1 ELSE 0 END) as executed,
+                SUM(CASE WHEN status = 'executed' AND COALESCE(dry_run, 0) = 0 THEN 1 ELSE 0 END) as executed,
+                SUM(CASE WHEN status = 'executed' AND COALESCE(dry_run, 0) = 1 THEN 1 ELSE 0 END) as simulated_executed,
                 SUM(CASE WHEN status = 'dismissed' THEN 1 ELSE 0 END) as dismissed,
                 SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
-                SUM(savings) as total_savings
+                SUM(CASE WHEN status = 'executed' AND COALESCE(dry_run, 0) = 0 THEN COALESCE(savings, 0) ELSE 0 END) as total_savings,
+                SUM(CASE WHEN status = 'executed' AND COALESCE(dry_run, 0) = 1 THEN COALESCE(savings, 0) ELSE 0 END) as simulated_savings
             FROM actions
-        `);
+            WHERE user_id = ?
+        `, [userId]);
 
         const recentActivity = queryAll(`
             SELECT * FROM actions
+            WHERE user_id = ?
             ORDER BY created_at DESC
             LIMIT 10
-        `);
+        `, [userId]);
 
         res.json({
             total: stats?.total || 0,
@@ -212,17 +228,20 @@ router.get('/stats/summary', (req, res) => {
                 pending: stats?.pending || 0,
                 approved: stats?.approved || 0,
                 executed: stats?.executed || 0,
+                simulatedExecuted: stats?.simulated_executed || 0,
                 dismissed: stats?.dismissed || 0,
                 failed: stats?.failed || 0
             },
             totalSavings: stats?.total_savings || 0,
+            totalSimulatedSavings: stats?.simulated_savings || 0,
             recentActivity: recentActivity.map(a => ({
                 id: a.id,
                 resourceName: a.resource_name,
                 actionType: a.action_type,
                 status: a.status,
                 createdAt: a.created_at,
-                savings: a.savings
+                savings: a.savings,
+                dryRun: Boolean(a.dry_run)
             }))
         });
     } catch (error) {

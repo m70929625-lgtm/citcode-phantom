@@ -1,8 +1,15 @@
 import { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import { RefreshCw, Server, Activity, Network, Clock, Search, Database, Boxes, FunctionSquare } from 'lucide-react';
 import GlassCard from './GlassCard';
 import { getLatestMetrics, getMetricsSummary } from '../hooks/useApi';
 import { formatPercent, formatRelativeTime, formatBytes, formatNumber } from '../utils/formatters';
+
+function mapWindowToSummaryPeriod(window) {
+  if (window === '7d') return '7d';
+  if (window === '30d' || window === '90d') return '30d';
+  return '24h';
+}
 
 function getResourceIcon(resourceType) {
   if (resourceType === 'RDS') return Database;
@@ -105,7 +112,7 @@ function getMetricCards(resource, metrics) {
   ];
 }
 
-export default function ResourceMonitor() {
+export default function ResourceMonitor({ filters = {} }) {
   const [resources, setResources] = useState([]);
   const [metrics, setMetrics] = useState({});
   const [loading, setLoading] = useState(true);
@@ -114,14 +121,14 @@ export default function ResourceMonitor() {
 
   useEffect(() => {
     loadData();
-  }, []);
+  }, [filters.window]);
 
   const loadData = async () => {
     setLoading(true);
     try {
       const [latestData, summaryData] = await Promise.all([
         getLatestMetrics(),
-        getMetricsSummary('24h')
+        getMetricsSummary(mapWindowToSummaryPeriod(filters.window))
       ]);
 
       setResources(latestData.data || []);
@@ -140,10 +147,14 @@ export default function ResourceMonitor() {
     }
   };
 
-  const filteredResources = resources.filter(r =>
-    r.resourceName?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    r.resourceId?.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  const filteredResources = resources.filter((resource) => {
+    const searchMatch =
+      resource.resourceName?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      resource.resourceId?.toLowerCase().includes(searchQuery.toLowerCase());
+
+    const serviceMatch = !filters.service || filters.service === 'all' || resource.resourceType === filters.service;
+    return searchMatch && serviceMatch;
+  });
 
   return (
     <div className="space-y-6">
@@ -235,7 +246,9 @@ export default function ResourceMonitor() {
                       <ResourceIcon className="w-5 h-5 text-apple-blue" />
                     </div>
                     <div>
-                      <p className="font-medium text-apple-gray-800">{resource.resourceName}</p>
+                      <Link to={`/resources/${encodeURIComponent(resource.resourceId)}`} className="font-medium text-apple-gray-800 hover:text-apple-blue">
+                        {resource.resourceName}
+                      </Link>
                       <p className="text-xs text-apple-gray-400 font-mono">{resource.resourceId.slice(0, 16)}...</p>
                     </div>
                   </div>

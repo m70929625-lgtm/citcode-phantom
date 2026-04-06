@@ -1,37 +1,35 @@
 const { queryAll, queryOne, runSql } = require('../config/database');
 const awsService = require('./awsService');
 const loggerService = require('./loggerService');
+const userSettingsService = require('./userSettingsService');
 const { v4: uuidv4 } = require('uuid');
-
-let isDryRun = true;
-let automationLevel = 'ask';
 
 function normalizeBoolean(value) {
     return value === true || value === 'true';
 }
 
+function getDryRunSetting(userId = null) {
+    return normalizeBoolean(userSettingsService.getUserSetting(userId, 'dry_run', { allowGlobalFallback: true }));
+}
+
+function getAutomationLevelSetting(userId = null) {
+    const value = userSettingsService.getUserSetting(userId, 'automation_level', { allowGlobalFallback: true });
+    return ['suggest', 'ask', 'auto'].includes(value) ? value : 'ask';
+}
+
 function initialize() {
-    const dryRunSetting = queryOne('SELECT value FROM settings WHERE key = ?', ['dry_run']);
-    const automationLevelSetting = queryOne('SELECT value FROM settings WHERE key = ?', ['automation_level']);
-
-    isDryRun = normalizeBoolean(dryRunSetting?.value);
-    automationLevel = automationLevelSetting?.value || 'ask';
-
-    loggerService.info('automation', `Automation engine initialized (dry_run: ${isDryRun}, level: ${automationLevel})`);
+    loggerService.info('automation', 'Automation engine initialized (user-scoped settings enabled)');
 }
 
-function setDryRun(value) {
-    isDryRun = normalizeBoolean(value);
-    runSql(`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)`,
-        ['dry_run', isDryRun.toString(), new Date().toISOString()]);
-    loggerService.info('automation', `Dry run mode ${isDryRun ? 'enabled' : 'disabled'}`);
+function setDryRun(userId, value) {
+    userSettingsService.setUserSetting(userId, 'dry_run', normalizeBoolean(value).toString());
+    loggerService.info('automation', 'Dry run mode updated', { userId, dryRun: normalizeBoolean(value) });
 }
 
-function setAutomationLevel(value) {
-    automationLevel = ['suggest', 'ask', 'auto'].includes(value) ? value : 'ask';
-    runSql(`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)`,
-        ['automation_level', automationLevel, new Date().toISOString()]);
-    loggerService.info('automation', `Automation level set to ${automationLevel}`);
+function setAutomationLevel(userId, value) {
+    const level = ['suggest', 'ask', 'auto'].includes(value) ? value : 'ask';
+    userSettingsService.setUserSetting(userId, 'automation_level', level);
+    loggerService.info('automation', 'Automation level updated', { userId, automationLevel: level });
 }
 
 async function executeAction(actionId) {
@@ -45,66 +43,71 @@ async function executeAction(actionId) {
         throw new Error('Action must be approved before execution');
     }
 
-        const dryRun = Boolean(action.dry_run);
-        const actionMessage = dryRun 
-            ? `Successfully simulated ${action.action_type} (Dry Run)`
-            : `Successfully executed ${action.action_type}`;
+    const userId = action.user_id || null;
+    const dryRun = Boolean(action.dry_run);
+    const actionMessage = dryRun
+        ? `Successfully simulated ${action.action_type} (Dry Run)`
+        : `Successfully executed ${action.action_type}`;
 
-        loggerService.info('automation', `Executing action ${actionId}`, { type: action.action_type, dryRun });
+    loggerService.info('automation', `Executing action ${actionId}`, { type: action.action_type, dryRun, userId });
 
-        try {
-            let result;
+    try {
+        let result;
 
-            switch (action.action_type) {
-                case 'STOP_INSTANCE':
-                    result = await awsService.stopInstance(action.resource_id, dryRun);
-                    break;
-                case 'START_INSTANCE':
-                    result = await awsService.startInstance(action.resource_id, dryRun);
-                    break;
-                case 'SEND_ALERT':
-                    // SEND_ALERT is an internal notification action, no AWS call needed
-                    result = {
-                        success: true,
-                        message: 'Cost anomaly alert sent',
-                        notificationType: 'COST_ANOMALY',
-                        timestamp: new Date().toISOString()
-                    };
-                    break;
-                default:
-                    throw new Error(`Unknown action type: ${action.action_type}`);
-            }
+        switch (action.action_type) {
+            case 'STOP_INSTANCE':
+                result = await awsService.stopInstance(action.resource_id, dryRun, userId);
+                break;
+            case 'START_INSTANCE':
+                result = await awsService.startInstance(action.resource_id, dryRun, userId);
+                break;
+            case 'SEND_ALERT':
+                result = {
+                    success: true,
+                    message: 'Cost anomaly alert sent',
+                    notificationType: 'COST_ANOMALY',
+                    timestamp: new Date().toISOString()
+                };
+                break;
+            default:
+                throw new Error(`Unknown action type: ${action.action_type}`);
+        }
 
-            const finalResult = {
-                ...result,
-                message: actionMessage,
-                timestamp: new Date().toISOString()
-            };
+        const finalResult = {
+            ...result,
+            message: actionMessage,
+            timestamp: new Date().toISOString()
+        };
 
-            runSql(`
-                UPDATE actions SET status = 'executed', executed_at = ?, result = ? WHERE id = ?
-            `, [new Date().toISOString(), JSON.stringify(finalResult), actionId]);
+        runSql('UPDATE actions SET status = ?, executed_at = ?, result = ? WHERE id = ?', [
+            'executed',
+            new Date().toISOString(),
+            JSON.stringify(finalResult),
+            actionId
+        ]);
 
         if (action.anomaly_id) {
-            runSql(`UPDATE anomalies SET status = 'resolved', updated_at = ? WHERE id = ?`,
-                [new Date().toISOString(), action.anomaly_id]);
+            runSql('UPDATE anomalies SET status = ?, updated_at = ? WHERE id = ? AND user_id = ?', [
+                'resolved',
+                new Date().toISOString(),
+                action.anomaly_id,
+                userId
+            ]);
         }
 
         loggerService.log(
             dryRun ? 'info' : 'warn',
             'automation',
             `Action ${actionId} executed ${dryRun ? '(DRY RUN)' : ''}`,
-            { result },
+            { result, userId },
             action.resource_id,
             action.action_type
         );
 
         return { success: true, result, dryRun };
     } catch (error) {
-        runSql(`UPDATE actions SET status = 'failed', error = ? WHERE id = ?`,
-            [error.message, actionId]);
-
-        loggerService.error('automation', `Action ${actionId} failed`, { error: error.message });
+        runSql('UPDATE actions SET status = ?, error = ? WHERE id = ?', ['failed', error.message, actionId]);
+        loggerService.error('automation', `Action ${actionId} failed`, { error: error.message, userId });
         throw error;
     }
 }
@@ -113,53 +116,57 @@ function isCrucial(resourceName, actionType) {
     const crucialKeywords = ['prod', 'production', 'main', 'primary', 'critical', 'database', 'db', 'master'];
     const lowerName = (resourceName || '').toLowerCase();
 
-    const isCrucialResource = crucialKeywords.some(keyword => lowerName.includes(keyword));
-
-    // For now, stopping instances is the primary disruptive action
+    const isCrucialResource = crucialKeywords.some((keyword) => lowerName.includes(keyword));
     const isDisruptiveAction = ['STOP_INSTANCE', 'STOP_RDS'].includes(actionType);
 
     return isCrucialResource && isDisruptiveAction;
 }
 
-function createAction(anomalyId, resourceId, resourceName, actionType, estimatedSavings = 0, confidence = 0) {
+function resolveActionUserId(providedUserId, anomalyId) {
+    if (providedUserId) return providedUserId;
+    if (!anomalyId) return null;
+    return queryOne('SELECT user_id FROM anomalies WHERE id = ?', [anomalyId])?.user_id || null;
+}
+
+function createAction(anomalyId, resourceId, resourceName, actionType, estimatedSavings = 0, confidence = 0, userId = null) {
     if (!['STOP_INSTANCE', 'START_INSTANCE', 'SEND_ALERT'].includes(actionType)) {
-        loggerService.info('automation', 'Skipping unsupported action type', { resourceId, actionType });
+        loggerService.info('automation', 'Skipping unsupported action type', { resourceId, actionType, userId });
+        return null;
+    }
+
+    const scopedUserId = resolveActionUserId(userId, anomalyId);
+    if (!scopedUserId) {
+        loggerService.warn('automation', 'Cannot create action without user scope', { actionType, resourceId, anomalyId });
         return null;
     }
 
     const recentAction = queryOne(`
         SELECT * FROM actions
-        WHERE resource_id = ? AND action_type = ?
+        WHERE user_id = ? AND resource_id = ? AND action_type = ?
         AND created_at > datetime('now', '-5 minutes')
         AND status IN ('pending', 'approved', 'executed')
-    `, [resourceId, actionType]);
+    `, [scopedUserId, resourceId, actionType]);
 
     if (recentAction) {
-        loggerService.info('automation', 'Action skipped due to cooldown', { resourceId, actionType });
+        loggerService.info('automation', 'Action skipped due to cooldown', { userId: scopedUserId, resourceId, actionType });
         return null;
     }
 
     const actionId = `action_${uuidv4().slice(0, 8)}`;
     const crucial = isCrucial(resourceName, actionType);
     const isNotificationOnly = actionType === 'SEND_ALERT';
+    const dryRun = getDryRunSetting(scopedUserId);
+    const automationLevel = getAutomationLevelSetting(scopedUserId);
 
-    // automationLevel enforcement:
-    // 'suggest' - Never auto-approve; everything goes to pending
-    // 'ask'    - Auto-approve if: not crucial OR confidence < 0.5; require approval if crucial AND confidence >= 0.5
-    // 'auto'   - Auto-approve if: not crucial; crucial resources always need approval
     let requiresApproval = true;
 
     if (isNotificationOnly) {
-        // SEND_ALERT is always safe to auto-approve
         requiresApproval = false;
     } else if (automationLevel === 'suggest') {
-        // In suggest mode, nothing is auto-approved
         requiresApproval = true;
     } else if (automationLevel === 'ask') {
-        // In ask mode, auto-approve low-confidence or non-crucial actions
         requiresApproval = crucial && confidence >= 0.5;
     } else if (automationLevel === 'auto') {
-        // In auto mode, auto-approve non-crucial actions
         requiresApproval = crucial;
     }
 
@@ -167,24 +174,23 @@ function createAction(anomalyId, resourceId, resourceName, actionType, estimated
 
     runSql(`
         INSERT INTO actions (
-            id, anomaly_id, resource_id, resource_name, action_type,
+            id, user_id, anomaly_id, resource_id, resource_name, action_type,
             status, dry_run, requires_approval, savings
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, [
         actionId,
+        scopedUserId,
         anomalyId,
         resourceId,
         resourceName,
         actionType,
         initialStatus,
-        isDryRun ? 1 : 0,
+        dryRun ? 1 : 0,
         requiresApproval ? 1 : 0,
         estimatedSavings
     ]);
 
-    // Auto-approve and execute in 'auto' mode for non-crucial actions
-    if (!requiresApproval && automationLevel === 'auto' && !isDryRun) {
-        // Execute asynchronously to avoid blocking
+    if (!requiresApproval && automationLevel === 'auto' && !dryRun) {
         setImmediate(() => {
             try {
                 const action = queryOne('SELECT * FROM actions WHERE id = ?', [actionId]);
@@ -192,13 +198,14 @@ function createAction(anomalyId, resourceId, resourceName, actionType, estimated
                     executeAction(actionId);
                 }
             } catch (err) {
-                loggerService.error('automation', `Auto-execute failed for ${actionId}`, { error: err.message });
+                loggerService.error('automation', `Auto-execute failed for ${actionId}`, { error: err.message, userId: scopedUserId });
             }
         });
     }
 
     loggerService.info('automation', 'Action created', {
         id: actionId,
+        userId: scopedUserId,
         type: actionType,
         resource: resourceId,
         confidence,
@@ -210,9 +217,13 @@ function createAction(anomalyId, resourceId, resourceName, actionType, estimated
     return actionId;
 }
 
-function approveAction(actionId, approver = 'admin') {
+function approveAction(actionId, approver = 'admin', userId = null) {
     const action = queryOne('SELECT * FROM actions WHERE id = ?', [actionId]);
     if (!action) {
+        throw new Error('Action not found');
+    }
+
+    if (userId && action.user_id !== userId) {
         throw new Error('Action not found');
     }
 
@@ -220,27 +231,34 @@ function approveAction(actionId, approver = 'admin') {
         throw new Error('Only pending actions can be approved');
     }
 
-    runSql(`
-        UPDATE actions SET status = 'approved', approved_at = ?, approved_by = ? WHERE id = ?
-    `, [new Date().toISOString(), approver, actionId]);
+    runSql('UPDATE actions SET status = ?, approved_at = ?, approved_by = ? WHERE id = ?', [
+        'approved',
+        new Date().toISOString(),
+        approver,
+        actionId
+    ]);
 
-    loggerService.info('automation', `Action ${actionId} approved by ${approver}`);
-
+    loggerService.info('automation', `Action ${actionId} approved`, { userId: action.user_id, approver });
     return queryOne('SELECT * FROM actions WHERE id = ?', [actionId]);
 }
 
-function dismissAction(actionId) {
-    runSql(`UPDATE actions SET status = 'dismissed' WHERE id = ?`, [actionId]);
-    loggerService.info('automation', `Action ${actionId} dismissed`);
+function dismissAction(actionId, userId = null) {
+    const action = queryOne('SELECT * FROM actions WHERE id = ?', [actionId]);
+    if (!action || (userId && action.user_id !== userId)) {
+        throw new Error('Action not found');
+    }
+
+    runSql('UPDATE actions SET status = ? WHERE id = ?', ['dismissed', actionId]);
+    loggerService.info('automation', `Action ${actionId} dismissed`, { userId: action.user_id });
     return queryOne('SELECT * FROM actions WHERE id = ?', [actionId]);
 }
 
-function getPendingActions() {
-    return queryAll(`SELECT * FROM actions WHERE status = 'pending' ORDER BY created_at DESC`);
+function getPendingActions(userId) {
+    return queryAll('SELECT * FROM actions WHERE user_id = ? AND status = ? ORDER BY created_at DESC', [userId, 'pending']);
 }
 
-function getActionHistory(limit = 50) {
-    return queryAll(`SELECT * FROM actions ORDER BY created_at DESC LIMIT ?`, [limit]);
+function getActionHistory(userId, limit = 50) {
+    return queryAll('SELECT * FROM actions WHERE user_id = ? ORDER BY created_at DESC LIMIT ?', [userId, limit]);
 }
 
 module.exports = {
@@ -252,7 +270,7 @@ module.exports = {
     dismissAction,
     getPendingActions,
     getActionHistory,
-    isDryRun: () => isDryRun,
-    getAutomationLevel: () => automationLevel,
+    isDryRun: getDryRunSetting,
+    getAutomationLevel: getAutomationLevelSetting,
     setAutomationLevel
 };

@@ -6,10 +6,11 @@ const loggerService = require('../services/loggerService');
 // GET /api/metrics - Fetch stored metrics
 router.get('/', (req, res) => {
     try {
+        const userId = req.session.userId;
         const { resourceId, metricType, startDate, endDate, limit = 1000 } = req.query;
 
-        let query = 'SELECT * FROM metrics WHERE 1=1';
-        const params = [];
+        let query = 'SELECT * FROM metrics WHERE user_id = ?';
+        const params = [userId];
 
         if (resourceId) {
             query += ' AND resource_id = ?';
@@ -62,8 +63,9 @@ router.get('/', (req, res) => {
 // POST /api/metrics/fetch - Trigger immediate metric fetch
 router.post('/fetch', async (req, res) => {
     try {
+        const userId = req.session.userId;
         const metricCollector = require('../services/metricCollector');
-        const result = await metricCollector.collectMetrics();
+        const result = await metricCollector.collectMetrics(userId);
         res.json({
             success: true,
             fetched: {
@@ -83,16 +85,19 @@ router.post('/fetch', async (req, res) => {
 // GET /api/metrics/latest - Get latest metrics for all resources
 router.get('/latest', (req, res) => {
     try {
+        const userId = req.session.userId;
         const data = queryAll(`
             SELECT m.* FROM metrics m
             INNER JOIN (
                 SELECT resource_id, metric_type, MAX(timestamp) as max_ts
                 FROM metrics
+                WHERE user_id = ?
                 GROUP BY resource_id, metric_type
             ) latest ON m.resource_id = latest.resource_id
                 AND m.metric_type = latest.metric_type
                 AND m.timestamp = latest.max_ts
-        `);
+            WHERE m.user_id = ?
+        `, [userId, userId]);
 
         const resources = {};
         for (const m of data) {
@@ -124,6 +129,7 @@ router.get('/latest', (req, res) => {
 // GET /api/metrics/summary - Get aggregated metric summaries
 router.get('/summary', (req, res) => {
     try {
+        const userId = req.session.userId;
         const { period = '24h' } = req.query;
 
         let timeCondition;
@@ -145,9 +151,9 @@ router.get('/summary', (req, res) => {
                 MIN(value) as min_value,
                 COUNT(*) as data_points
             FROM metrics
-            WHERE ${timeCondition}
+            WHERE user_id = ? AND ${timeCondition}
             GROUP BY resource_id, resource_type, metric_type
-        `);
+        `, [userId]);
 
         res.json({
             period,

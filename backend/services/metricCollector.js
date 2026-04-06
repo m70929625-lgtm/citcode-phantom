@@ -5,200 +5,164 @@ const automationService = require('./automationService');
 const alertService = require('./alertService');
 const loggerService = require('./loggerService');
 const costAnomalyService = require('./costAnomalyService');
+const userSettingsService = require('./userSettingsService');
 const { v4: uuidv4 } = require('uuid');
 
 let collectionInterval = null;
-const COLLECTION_INTERVAL = process.env.METRIC_INTERVAL || 300000;
+const MIN_COLLECTION_INTERVAL_MS = 30000;
+const MAX_COLLECTION_INTERVAL_MS = 15 * 60 * 1000;
+const DEFAULT_COLLECTION_INTERVAL_MS = Number.parseInt(process.env.METRIC_INTERVAL || '60000', 10);
+const SCHEDULER_TICK_MS = Math.min(MIN_COLLECTION_INTERVAL_MS, DEFAULT_COLLECTION_INTERVAL_MS);
 
-async function collectMetrics() {
-    loggerService.info('collector', 'Starting metric collection...');
+function clampCollectionInterval(intervalMs) {
+    if (!Number.isFinite(intervalMs)) {
+        return DEFAULT_COLLECTION_INTERVAL_MS;
+    }
+
+    return Math.min(Math.max(intervalMs, MIN_COLLECTION_INTERVAL_MS), MAX_COLLECTION_INTERVAL_MS);
+}
+
+function getCollectionIntervalMs(userId, overrideIntervalMs = null) {
+    if (overrideIntervalMs !== null && overrideIntervalMs !== undefined) {
+        return clampCollectionInterval(Number.parseInt(overrideIntervalMs, 10));
+    }
+
+    const configuredInterval = Number.parseInt(
+        userSettingsService.getUserSetting(userId, 'metric_interval', { allowGlobalFallback: true }) || DEFAULT_COLLECTION_INTERVAL_MS,
+        10
+    );
+
+    return clampCollectionInterval(configuredInterval);
+}
+
+function shouldCollectNow(userId) {
+    const lastFetch = userSettingsService.getUserSetting(userId, 'last_fetch', { allowGlobalFallback: false });
+    if (!lastFetch) {
+        return true;
+    }
+
+    const lastFetchTime = new Date(lastFetch).getTime();
+    if (!Number.isFinite(lastFetchTime)) {
+        return true;
+    }
+
+    const intervalMs = getCollectionIntervalMs(userId);
+    return Date.now() - lastFetchTime >= intervalMs;
+}
+
+function actionRowToAlertShape(action) {
+    return {
+        id: action.id,
+        actionType: action.action_type,
+        resourceId: action.resource_id,
+        resourceName: action.resource_name,
+        savings: action.savings
+    };
+}
+
+async function collectMetrics(userId) {
+    if (!userId) {
+        throw new Error('userId is required for metric collection');
+    }
+
+    loggerService.info('collector', 'Starting metric collection', { userId });
 
     try {
         const timestamp = new Date().toISOString();
 
-        const ec2Instances = await awsService.getEC2Instances();
+        const ec2Instances = await awsService.getEC2Instances(userId);
         if (ec2Instances.length > 0) {
-            const instanceIds = ec2Instances.map(i => i.id);
-            const metrics = await awsService.getEC2Metrics(instanceIds);
+            const instanceIds = ec2Instances.map((i) => i.id);
+            const metrics = await awsService.getEC2Metrics(instanceIds, 300, userId);
 
             for (const instance of ec2Instances) {
-                const metricData = metrics.find(m => m.resourceId === instance.id) || {};
-
+                const metricData = metrics.find((m) => m.resourceId === instance.id) || {};
                 const metricsToInsert = [
-                    {
-                        timestamp,
-                        resourceId: instance.id,
-                        resourceType: 'EC2',
-                        resourceName: instance.name,
-                        metricType: 'cpu_utilization',
-                        value: metricData.cpu || 0,
-                        unit: 'percent'
-                    },
-                    {
-                        timestamp,
-                        resourceId: instance.id,
-                        resourceType: 'EC2',
-                        resourceName: instance.name,
-                        metricType: 'network_in',
-                        value: metricData.networkIn || 0,
-                        unit: 'bytes'
-                    },
-                    {
-                        timestamp,
-                        resourceId: instance.id,
-                        resourceType: 'EC2',
-                        resourceName: instance.name,
-                        metricType: 'network_out',
-                        value: metricData.networkOut || 0,
-                        unit: 'bytes'
-                    }
+                    { metricType: 'cpu_utilization', value: metricData.cpu || 0, unit: 'percent' },
+                    { metricType: 'network_in', value: metricData.networkIn || 0, unit: 'bytes' },
+                    { metricType: 'network_out', value: metricData.networkOut || 0, unit: 'bytes' }
                 ];
 
-                for (const m of metricsToInsert) {
+                for (const metric of metricsToInsert) {
                     runSql(`
-                        INSERT INTO metrics (timestamp, resource_id, resource_type, resource_name, metric_type, value, unit)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    `, [m.timestamp, m.resourceId, m.resourceType, m.resourceName, m.metricType, m.value, m.unit]);
+                        INSERT INTO metrics (user_id, timestamp, resource_id, resource_type, resource_name, metric_type, value, unit)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    `, [userId, timestamp, instance.id, 'EC2', instance.name, metric.metricType, metric.value, metric.unit]);
                 }
             }
 
-            loggerService.info('collector', `Collected metrics for ${ec2Instances.length} EC2 instances`);
+            loggerService.info('collector', `Collected metrics for ${ec2Instances.length} EC2 instances`, { userId });
         }
 
-        const s3Buckets = await awsService.getS3Buckets();
-        const s3Metrics = await awsService.getS3BucketMetrics(s3Buckets);
+        const s3Buckets = await awsService.getS3Buckets(userId);
+        const s3Metrics = await awsService.getS3BucketMetrics(s3Buckets, userId);
         for (const bucket of s3Buckets) {
-            const metricData = s3Metrics.find(m => m.resourceId === bucket.id) || {};
+            const metricData = s3Metrics.find((m) => m.resourceId === bucket.id) || {};
             const metricsToInsert = [
-                {
-                    timestamp,
-                    resourceId: bucket.id,
-                    resourceType: 'S3',
-                    resourceName: bucket.name,
-                    metricType: 'object_count',
-                    value: metricData.objectCount || 0,
-                    unit: 'count'
-                },
-                {
-                    timestamp,
-                    resourceId: bucket.id,
-                    resourceType: 'S3',
-                    resourceName: bucket.name,
-                    metricType: 'storage_bytes',
-                    value: metricData.totalSize || 0,
-                    unit: 'bytes'
-                }
+                { metricType: 'object_count', value: metricData.objectCount || 0, unit: 'count' },
+                { metricType: 'storage_bytes', value: metricData.totalSize || 0, unit: 'bytes' }
             ];
 
-            for (const m of metricsToInsert) {
+            for (const metric of metricsToInsert) {
                 runSql(`
-                    INSERT INTO metrics (timestamp, resource_id, resource_type, resource_name, metric_type, value, unit)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                `, [m.timestamp, m.resourceId, m.resourceType, m.resourceName, m.metricType, m.value, m.unit]);
+                    INSERT INTO metrics (user_id, timestamp, resource_id, resource_type, resource_name, metric_type, value, unit)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                `, [userId, timestamp, bucket.id, 'S3', bucket.name, metric.metricType, metric.value, metric.unit]);
             }
         }
 
-        const rdsInstances = await awsService.getRDSInstances();
-        const rdsMetrics = await awsService.getRDSMetrics(rdsInstances);
+        const rdsInstances = await awsService.getRDSInstances(userId);
+        const rdsMetrics = await awsService.getRDSMetrics(rdsInstances, 300, userId);
         for (const instance of rdsInstances) {
-            const metricData = rdsMetrics.find(m => m.resourceId === instance.id) || {};
+            const metricData = rdsMetrics.find((m) => m.resourceId === instance.id) || {};
             const metricsToInsert = [
-                {
-                    timestamp,
-                    resourceId: instance.id,
-                    resourceType: 'RDS',
-                    resourceName: instance.name,
-                    metricType: 'cpu_utilization',
-                    value: metricData.cpu || 0,
-                    unit: 'percent'
-                },
-                {
-                    timestamp,
-                    resourceId: instance.id,
-                    resourceType: 'RDS',
-                    resourceName: instance.name,
-                    metricType: 'db_connections',
-                    value: metricData.connections || 0,
-                    unit: 'count'
-                },
-                {
-                    timestamp,
-                    resourceId: instance.id,
-                    resourceType: 'RDS',
-                    resourceName: instance.name,
-                    metricType: 'free_storage_bytes',
-                    value: metricData.freeStorage || 0,
-                    unit: 'bytes'
-                }
+                { metricType: 'cpu_utilization', value: metricData.cpu || 0, unit: 'percent' },
+                { metricType: 'db_connections', value: metricData.connections || 0, unit: 'count' },
+                { metricType: 'free_storage_bytes', value: metricData.freeStorage || 0, unit: 'bytes' }
             ];
 
-            for (const m of metricsToInsert) {
+            for (const metric of metricsToInsert) {
                 runSql(`
-                    INSERT INTO metrics (timestamp, resource_id, resource_type, resource_name, metric_type, value, unit)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                `, [m.timestamp, m.resourceId, m.resourceType, m.resourceName, m.metricType, m.value, m.unit]);
+                    INSERT INTO metrics (user_id, timestamp, resource_id, resource_type, resource_name, metric_type, value, unit)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                `, [userId, timestamp, instance.id, 'RDS', instance.name, metric.metricType, metric.value, metric.unit]);
             }
         }
 
-        const lambdaFunctions = await awsService.getLambdaFunctions();
-        const lambdaMetrics = await awsService.getLambdaMetrics(lambdaFunctions);
+        const lambdaFunctions = await awsService.getLambdaFunctions(userId);
+        const lambdaMetrics = await awsService.getLambdaMetrics(lambdaFunctions, 300, userId);
         for (const fn of lambdaFunctions) {
-            const metricData = lambdaMetrics.find(m => m.resourceId === fn.id) || {};
+            const metricData = lambdaMetrics.find((m) => m.resourceId === fn.id) || {};
             const metricsToInsert = [
-                {
-                    timestamp,
-                    resourceId: fn.id,
-                    resourceType: 'Lambda',
-                    resourceName: fn.name,
-                    metricType: 'invocations',
-                    value: metricData.invocations || 0,
-                    unit: 'count'
-                },
-                {
-                    timestamp,
-                    resourceId: fn.id,
-                    resourceType: 'Lambda',
-                    resourceName: fn.name,
-                    metricType: 'errors',
-                    value: metricData.errors || 0,
-                    unit: 'count'
-                },
-                {
-                    timestamp,
-                    resourceId: fn.id,
-                    resourceType: 'Lambda',
-                    resourceName: fn.name,
-                    metricType: 'duration_ms',
-                    value: metricData.duration || 0,
-                    unit: 'milliseconds'
-                }
+                { metricType: 'invocations', value: metricData.invocations || 0, unit: 'count' },
+                { metricType: 'errors', value: metricData.errors || 0, unit: 'count' },
+                { metricType: 'duration_ms', value: metricData.duration || 0, unit: 'milliseconds' }
             ];
 
-            for (const m of metricsToInsert) {
+            for (const metric of metricsToInsert) {
                 runSql(`
-                    INSERT INTO metrics (timestamp, resource_id, resource_type, resource_name, metric_type, value, unit)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                `, [m.timestamp, m.resourceId, m.resourceType, m.resourceName, m.metricType, m.value, m.unit]);
+                    INSERT INTO metrics (user_id, timestamp, resource_id, resource_type, resource_name, metric_type, value, unit)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                `, [userId, timestamp, fn.id, 'Lambda', fn.name, metric.metricType, metric.value, metric.unit]);
             }
         }
 
-        runSql(`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)`,
-            ['last_fetch', timestamp, new Date().toISOString()]);
+        userSettingsService.setUserSetting(userId, 'last_fetch', timestamp);
 
-        await runAnomalyDetection();
-        
-        // Run cost anomaly detection every 6th collection (30 minutes) or on startup
-        const collectionCount = parseInt(queryOne('SELECT value FROM settings WHERE key = ?', ['collection_count'])?.value || '0');
+        await runAnomalyDetection(userId);
+
+        const collectionCount = parseInt(
+            userSettingsService.getUserSetting(userId, 'collection_count', { allowGlobalFallback: false }) || '0',
+            10
+        );
+
         const shouldCheckCosts = collectionCount % 6 === 0 || collectionCount === 0;
-        
         if (shouldCheckCosts) {
-            loggerService.info('collector', 'Running cost anomaly detection...');
-            await costAnomalyService.detectCostAnomalies();
+            loggerService.info('collector', 'Running cost anomaly detection', { userId });
+            await costAnomalyService.detectCostAnomalies(userId);
         }
-        
-        // Increment collection counter
-        runSql(`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)`,
-            ['collection_count', (collectionCount + 1).toString(), new Date().toISOString()]);
+
+        userSettingsService.setUserSetting(userId, 'collection_count', String(collectionCount + 1));
 
         return {
             ec2: ec2Instances.length,
@@ -208,18 +172,21 @@ async function collectMetrics() {
             timestamp
         };
     } catch (error) {
-        loggerService.error('collector', 'Metric collection failed', { error: error.message });
+        loggerService.error('collector', 'Metric collection failed', { error: error.message, userId });
         throw error;
     }
 }
 
-async function runAnomalyDetection() {
+async function runAnomalyDetection(userId) {
     try {
-        const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+        const lookbackWindowHours = 1;
+        const lookbackTimestamp = new Date(Date.now() - lookbackWindowHours * 60 * 60 * 1000).toISOString();
 
         const recentMetrics = queryAll(`
-            SELECT * FROM metrics WHERE timestamp > ? ORDER BY timestamp DESC
-        `, [oneHourAgo]);
+            SELECT * FROM metrics
+            WHERE user_id = ? AND timestamp > ?
+            ORDER BY timestamp DESC
+        `, [userId, lookbackTimestamp]);
 
         const resourceGroups = {};
         for (const metric of recentMetrics) {
@@ -245,9 +212,7 @@ async function runAnomalyDetection() {
 
         for (const resourceId in resourceGroups) {
             const data = resourceGroups[resourceId];
-
-            if (data.resourceType !== 'EC2') continue;
-            if (data.cpu.length === 0) continue;
+            if (data.resourceType !== 'EC2' || data.cpu.length === 0) continue;
 
             const features = {
                 cpu: average(data.cpu),
@@ -261,99 +226,115 @@ async function runAnomalyDetection() {
                 networkMa7: average(data.networkIn)
             };
 
-            const result = mlService.detectAnomaly(features);
+            const result = mlService.detectAnomaly(features, null, userId);
+            if (!result.isAnomaly) continue;
 
-            if (result.isAnomaly) {
-                const anomalyInfo = mlService.determineAnomalyType(features, result.anomalyScore);
+            const anomalyInfo = mlService.determineAnomalyType(features, result.anomalyScore);
 
-                const existingAnomaly = queryOne(`
-                    SELECT * FROM anomalies
-                    WHERE resource_id = ? AND status = 'new'
-                    AND detected_at > datetime('now', '-1 hour')
-                `, [resourceId]);
+            const existingAnomaly = queryOne(`
+                SELECT id FROM anomalies
+                WHERE user_id = ? AND resource_id = ? AND status = 'new'
+                AND detected_at > datetime('now', '-1 hour')
+            `, [userId, resourceId]);
 
-                if (!existingAnomaly) {
-                    const anomalyId = `anomaly_${uuidv4().slice(0, 8)}`;
+            if (existingAnomaly) continue;
 
-                    runSql(`
-                        INSERT INTO anomalies (
-                            id, resource_id, resource_name, resource_type,
-                            anomaly_type, detected_at, anomaly_score, confidence,
-                            features, recommended_action, estimated_savings, status
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                `, [
-                        anomalyId,
-                        resourceId,
-                        data.resourceName,
-                        data.resourceType,
-                        anomalyInfo.type,
-                        new Date().toISOString(),
-                        result.anomalyScore,
-                        result.confidence,
-                        JSON.stringify(result.features),
-                        anomalyInfo.action,
-                        anomalyInfo.savings,
-                        'new'
-                    ]);
+            const anomalyId = `anomaly_${uuidv4().slice(0, 8)}`;
 
-                    loggerService.log(
-                        'warn',
-                        'anomaly',
-                        `Anomaly detected: ${anomalyInfo.type} for ${resourceId}`,
-                        { score: result.anomalyScore, confidence: result.confidence },
-                        resourceId,
-                        anomalyInfo.action
-                    );
+            runSql(`
+                INSERT INTO anomalies (
+                    id, user_id, resource_id, resource_name, resource_type,
+                    anomaly_type, detected_at, anomaly_score, confidence,
+                    features, recommended_action, estimated_savings, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `, [
+                anomalyId,
+                userId,
+                resourceId,
+                data.resourceName,
+                data.resourceType,
+                anomalyInfo.type,
+                new Date().toISOString(),
+                result.anomalyScore,
+                result.confidence,
+                JSON.stringify(result.features),
+                anomalyInfo.action,
+                anomalyInfo.savings,
+                'new'
+            ]);
 
-                    // Alert the user about the anomaly
-                    alertService.alertAnomalyDetected({
-                        id: anomalyId,
-                        type: anomalyInfo.type,
-                        resourceId,
-                        resourceName: data.resourceName,
-                        resourceType: data.resourceType,
-                        savings: anomalyInfo.savings
-                    }, result.confidence, anomalyInfo.action);
+            loggerService.log(
+                'warn',
+                'anomaly',
+                `Anomaly detected: ${anomalyInfo.type} for ${resourceId}`,
+                { score: result.anomalyScore, confidence: result.confidence, userId },
+                resourceId,
+                anomalyInfo.action
+            );
 
-                    // Create action based on confidence and cruciality (logic is inside automationService)
-                    const actionId = automationService.createAction(
-                        anomalyId,
-                        resourceId,
-                        data.resourceName,
-                        anomalyInfo.action,
-                        anomalyInfo.savings,
-                        result.confidence
-                    );
+            alertService.alertAnomalyDetected(userId, {
+                id: anomalyId,
+                type: anomalyInfo.type,
+                resourceId,
+                resourceName: data.resourceName,
+                resourceType: data.resourceType,
+                savings: anomalyInfo.savings
+            }, result.confidence, anomalyInfo.action);
 
-                    if (actionId) {
-                        const action = queryOne('SELECT * FROM actions WHERE id = ?', [actionId]);
-                        
-                        // If it doesn't require approval (auto-execute), proceed
-                        if (action && !action.requires_approval) {
-                            try {
-                                automationService.approveAction(actionId, 'system:auto');
-                                
-                                // Alert that it's being auto-approved
-                                alertService.alertAutoApproved(action, { id: anomalyId, type: anomalyInfo.type }, result.confidence);
-                                
-                                await automationService.executeAction(actionId);
-                                
-                                // Alert that it's been executed
-                                const updatedAction = queryOne('SELECT * FROM actions WHERE id = ?', [actionId]);
-                                alertService.alertActionExecuted(updatedAction);
-                            } catch (actionError) {
-                                loggerService.error('automation', 'Automatic action execution failed', {
-                                    actionId,
-                                    error: actionError.message
-                                });
-                            }
-                        }
+            const actionId = automationService.createAction(
+                anomalyId,
+                resourceId,
+                data.resourceName,
+                anomalyInfo.action,
+                anomalyInfo.savings,
+                result.confidence,
+                userId
+            );
+
+            if (!actionId) continue;
+
+            let action = queryOne('SELECT * FROM actions WHERE id = ?', [actionId]);
+            if (action && !action.requires_approval) {
+                try {
+                    if (action.status === 'pending') {
+                        automationService.approveAction(actionId, 'system:auto', userId);
+                        action = queryOne('SELECT * FROM actions WHERE id = ?', [actionId]);
+                        alertService.alertAutoApproved(userId, actionRowToAlertShape(action), { id: anomalyId, type: anomalyInfo.type }, result.confidence);
                     }
+
+                    await automationService.executeAction(actionId);
+                    const updatedAction = queryOne('SELECT * FROM actions WHERE id = ?', [actionId]);
+                    alertService.alertActionExecuted(userId, actionRowToAlertShape(updatedAction));
+                } catch (actionError) {
+                    loggerService.error('automation', 'Automatic action execution failed', {
+                        actionId,
+                        userId,
+                        error: actionError.message
+                    });
                 }
             }
         }
     } catch (error) {
-        loggerService.error('ml', 'Anomaly detection failed', { error: error.message });
+        loggerService.error('ml', 'Anomaly detection failed', { error: error.message, userId });
+    }
+}
+
+async function collectMetricsForDueUsers() {
+    const usersWithAws = userSettingsService.getUsersWithAwsCredentials();
+
+    for (const user of usersWithAws) {
+        if (!shouldCollectNow(user.user_id)) {
+            continue;
+        }
+
+        try {
+            await collectMetrics(user.user_id);
+        } catch (error) {
+            loggerService.error('collector', 'Scheduled user collection failed', {
+                userId: user.user_id,
+                error: error.message
+            });
+        }
     }
 }
 
@@ -374,11 +355,11 @@ function start() {
     }
 
     collectionInterval = setInterval(() => {
-        collectMetrics().catch(console.error);
-    }, COLLECTION_INTERVAL);
+        collectMetricsForDueUsers().catch(console.error);
+    }, SCHEDULER_TICK_MS);
 
-    loggerService.info('collector', `Metric collector started (interval: ${COLLECTION_INTERVAL / 1000}s)`);
-    collectMetrics().catch(error => {
+    loggerService.info('collector', `Metric collector started (tick: ${SCHEDULER_TICK_MS / 1000}s)`);
+    collectMetricsForDueUsers().catch((error) => {
         loggerService.error('collector', 'Initial metric collection failed', { error: error.message });
     });
 }
@@ -391,9 +372,20 @@ function stop() {
     }
 }
 
+function restart() {
+    stop();
+    start();
+}
+
+function getCurrentIntervalMs() {
+    return SCHEDULER_TICK_MS;
+}
+
 module.exports = {
     collectMetrics,
     runAnomalyDetection,
     start,
-    stop
+    stop,
+    restart,
+    getCurrentIntervalMs
 };
